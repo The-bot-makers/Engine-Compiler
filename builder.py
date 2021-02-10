@@ -6,11 +6,6 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import PyInstaller.__main__
 
-PyInstaller.__main__.run([
-    'bench.py',
-    '--onefile'
-])
-
 subject = "Built engne"
 body = "Engine:"
 sender_email = "lichessbotall@gmail.com"
@@ -26,7 +21,7 @@ message["Subject"] = subject
 # Add body to email
 message.attach(MIMEText(body, "plain"))
 
-filename = "bench"  # In same directory as script
+filename = "YaneuraOu-by-gcc"  # In same directory as script
 
 # Open PDF file in binary mode
 with open(filename, "rb") as attachment:
