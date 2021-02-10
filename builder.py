@@ -20,7 +20,7 @@ message["Subject"] = subject
 # Add body to email
 message.attach(MIMEText(body, "plain"))
 
-filename = "YaneuraOu/source/eng"  # In same directory as script
+filename = "YaneuraOu/source/YaneuraOu-by-gcc"  # In same directory as script
 
 # Open PDF file in binary mode
 with open(filename, "rb") as attachment:
