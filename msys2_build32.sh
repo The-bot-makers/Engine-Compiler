@@ -1,37 +1,36 @@
 #!/bin/bash
 # -*- coding: utf-8 -*-
-# Ubuntu 上で Linux バイナリのビルド
-# sudo apt install build-essential clang libomp-dev libopenblas-dev
+# MSYS2 (MinGW 32-bit) 上で Windows バイナリのビルド
+# ビルド用パッケージの導入
+# $ pacman --needed --noconfirm -Syuu pactoys-git
+# $ pacboy --needed --noconfirm -Syuu clang:m openblas:x openmp:x toolchain:m base-devel:
+# MSYS2パッケージの更新、更新出来る項目が無くなるまで繰り返し実行、場合によってはMSYS2の再起動が必要
+# $ pacman -Syuu --noconfirm
 
 # Example 1: 全パターンのビルド
-# build.sh
+# msys2_build32.sh
 
 # Example 2: 指定パターンのビルド(-c: コンパイラ名, -e: エディション名, -t: ターゲット名)
-# build.sh -c clang++ -e YANEURAOU_ENGINE_NNUE
+# msys2_build32.sh -c clang++ -e YANEURAOU_ENGINE_NNUE
 
 # Example 3: 特定パターンのビルド(複数指定時はカンマ区切り、 -e, -t オプションのみワイルドカード使用可、ワイルドカード使用時はシングルクォートで囲む)
-# build.sh -c clang++,g++-9 -e '*KPPT*,*NNUE*'
+# msys2_build32.sh -c clang++,g++ -e '*KPPT*,*NNUE*'
 
-MAKE=make
+OS=Windows_NT
+MAKE=mingw32-make
 MAKEFILE=Makefile
 JOBS=`grep -c ^processor /proc/cpuinfo 2>/dev/null`
 
-ARCHCPUS='*'
 COMPILERS="clang++,g++"
 EDITIONS='*'
-OS='linux'
 TARGETS='*'
 
-while getopts a:c:e:o:t: OPT
+while getopts c:e:t: OPT
 do
   case $OPT in
-    a) ARCHCPUS="$OPTARG"
-      ;;
     c) COMPILERS="$OPTARG"
       ;;
     e) EDITIONS="$OPTARG"
-      ;;
-    o) OS="$OPTARG"
       ;;
     t) TARGETS="$OPTARG"
       ;;
@@ -39,29 +38,12 @@ do
 done
 
 set -f
-IFS=, eval 'ARCHCPUSARR=($ARCHCPUS)'
 IFS=, eval 'COMPILERSARR=($COMPILERS)'
 IFS=, eval 'EDITIONSARR=($EDITIONS)'
 IFS=, eval 'TARGETSARR=($TARGETS)'
 
 pushd `dirname $0`
 pushd ../source
-
-ARCHCPUS=(
-  AVX512VNNI
-  AVX512
-  AVXVNNI
-  AVX2
-  SSE42
-  SSE41
-  SSSE3
-  SSE2
-  NO_SSE
-  OTHER
-  ZEN1
-  ZEN2
-  ZEN3
-)
 
 EDITIONS=(
   YANEURAOU_ENGINE_NNUE
@@ -168,30 +150,19 @@ for COMPILER in ${COMPILERSARR[@]}; do
       if [[ $EDITION == $EDITIONPTN ]]; then
         set -f
         echo "* edition: ${EDITION}"
-        BUILDDIR=../build/${OS}/${DIRSTR[$EDITION]}
+        BUILDDIR=../build/windows/${DIRSTR[$EDITION]}
         mkdir -p ${BUILDDIR}
         for TARGET in ${TARGETS[@]}; do
           for TARGETPTN in ${TARGETSARR[@]}; do
             set +f
             if [[ $TARGET == $TARGETPTN ]]; then
-              set -f
               echo "* target: ${TARGET}"
-              for ARCHCPU in ${ARCHCPUS[@]}; do
-                for ARCHCPUPTN in ${ARCHCPUSARR[@]}; do
-                  set +f
-                  if [[ $ARCHCPU == $ARCHCPUPTN ]]; then
-                    set -f
-                    echo "* archcpu: ${ARCHCPU}"
-                    TGSTR=${FILESTR[$EDITION]}-${OS}-${CSTR}-${TARGET}-${ARCHCPU}
-                    ${MAKE} -f ${MAKEFILE} clean YANEURAOU_EDITION=${EDITIONSTR[$EDITION]}
-                    nice ${MAKE} -f ${MAKEFILE} -j${JOBS} ${TARGET} TARGET_CPU=${ARCHCPU} YANEURAOU_EDITION=${EDITIONSTR[$EDITION]} COMPILER=${COMPILER} > >(tee ${BUILDDIR}/${TGSTR}.log) || exit $?
-                    cp YaneuraOu-by-gcc ${BUILDDIR}/${TGSTR}
-                    ${MAKE} -f ${MAKEFILE} clean YANEURAOU_EDITION=${EDITIONSTR[$EDITION]}
-                    break
-                  fi
-                  set -f
-                done
-              done
+              TGSTR=YaneuraOu-${FILESTR[$EDITION]}-msys2-${CSTR}-${TARGET}
+              ${MAKE} -f ${MAKEFILE} clean YANEURAOU_EDITION=${EDITIONSTR[$EDITION]}
+              nice ${MAKE} -f ${MAKEFILE} -j${JOBS} ${TARGET} YANEURAOU_EDITION=${EDITIONSTR[$EDITION]} COMPILER=${COMPILER} TARGET_CPU=NO_SSE > >(tee ${BUILDDIR}/${TGSTR}.log) || exit $?
+              cp YaneuraOu-by-gcc.exe ${BUILDDIR}/${TGSTR}.exe
+              ${MAKE} -f ${MAKEFILE} clean YANEURAOU_EDITION=${EDITIONSTR[$EDITION]}
+              set -f
               break
             fi
             set -f

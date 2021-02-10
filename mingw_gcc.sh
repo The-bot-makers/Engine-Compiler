@@ -1,28 +1,28 @@
 #!/bin/bash
 # -*- coding: utf-8 -*-
-# Ubuntu 上で Linux バイナリのビルド
-# sudo apt install build-essential clang libomp-dev libopenblas-dev
+# Ubuntu 上で Windows バイナリのビルド (gcc)
+# sudo apt install build-essential mingw-w64 libopenblas-dev
 
 # Example 1: 全パターンのビルド
-# build.sh
+# mingw_gcc.sh
 
-# Example 2: 指定パターンのビルド(-c: コンパイラ名, -e: エディション名, -t: ターゲット名)
-# build.sh -c clang++ -e YANEURAOU_ENGINE_NNUE
+# Example 2: 指定パターンのビルド(-e: エディション名, -t: ターゲット名)
+# mingw_gcc.sh -e YANEURAOU_ENGINE_NNUE
 
-# Example 3: 特定パターンのビルド(複数指定時はカンマ区切り、 -e, -t オプションのみワイルドカード使用可、ワイルドカード使用時はシングルクォートで囲む)
-# build.sh -c clang++,g++-9 -e '*KPPT*,*NNUE*'
+# Example 3: 特定パターンのビルド(ワイルドカード使用時はシングルクォートで囲む)
+# mingw_gcc.sh -e '*KPPT*,*NNUE*'
 
 MAKE=make
 MAKEFILE=Makefile
 JOBS=`grep -c ^processor /proc/cpuinfo 2>/dev/null`
 
 ARCHCPUS='*'
-COMPILERS="clang++,g++"
+COMPILERS="x86_64-w64-mingw32-g++-posix,i686-w64-mingw32-g++-posix"
 EDITIONS='*'
-OS='linux'
+OS='Windows_NT'
 TARGETS='*'
 
-while getopts a:c:e:o:t: OPT
+while getopts a:c:e:t: OPT
 do
   case $OPT in
     a) ARCHCPUS="$OPTARG"
@@ -168,7 +168,7 @@ for COMPILER in ${COMPILERSARR[@]}; do
       if [[ $EDITION == $EDITIONPTN ]]; then
         set -f
         echo "* edition: ${EDITION}"
-        BUILDDIR=../build/${OS}/${DIRSTR[$EDITION]}
+        BUILDDIR=../build/mingw/${DIRSTR[$EDITION]}
         mkdir -p ${BUILDDIR}
         for TARGET in ${TARGETS[@]}; do
           for TARGETPTN in ${TARGETSARR[@]}; do
@@ -182,17 +182,16 @@ for COMPILER in ${COMPILERSARR[@]}; do
                   if [[ $ARCHCPU == $ARCHCPUPTN ]]; then
                     set -f
                     echo "* archcpu: ${ARCHCPU}"
-                    TGSTR=${FILESTR[$EDITION]}-${OS}-${CSTR}-${TARGET}-${ARCHCPU}
-                    ${MAKE} -f ${MAKEFILE} clean YANEURAOU_EDITION=${EDITIONSTR[$EDITION]}
-                    nice ${MAKE} -f ${MAKEFILE} -j${JOBS} ${TARGET} TARGET_CPU=${ARCHCPU} YANEURAOU_EDITION=${EDITIONSTR[$EDITION]} COMPILER=${COMPILER} > >(tee ${BUILDDIR}/${TGSTR}.log) || exit $?
-                    cp YaneuraOu-by-gcc ${BUILDDIR}/${TGSTR}
-                    ${MAKE} -f ${MAKEFILE} clean YANEURAOU_EDITION=${EDITIONSTR[$EDITION]}
+                    TGSTR=${FILESTR[$EDITION]}-windows-${CSTR}-${TARGET}-${ARCHCPU}
+                    ${MAKE} -f ${MAKEFILE} clean OS=${OS} YANEURAOU_EDITION=${EDITIONSTR[$EDITION]}
+                    nice ${MAKE} -f ${MAKEFILE} -j${JOBS} ${TARGET} OS=${OS} TARGET_CPU=${ARCHCPU} YANEURAOU_EDITION=${EDITIONSTR[$EDITION]} COMPILER=${COMPILER} > >(tee ${BUILDDIR}/${TGSTR}.log) || exit $?
+                    cp YaneuraOu-by-gcc.exe ${BUILDDIR}/${TGSTR}.exe
+                    ${MAKE} -f ${MAKEFILE} clean OS=${OS} YANEURAOU_EDITION=${EDITIONSTR[$EDITION]}
                     break
                   fi
                   set -f
                 done
               done
-              break
             fi
             set -f
           done
