@@ -1,2 +1,3 @@
 pyopenssl
 pyinstaller
+python-dev
