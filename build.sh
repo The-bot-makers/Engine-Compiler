@@ -19,7 +19,7 @@ COMP=clang++
 
 echo "- Building YANEURAOU $ARCH ... (patience advised)"
 
-make -f Makefile -C engine TARGET_CPU=$ARCH YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE COMPILER=$COMP > /dev/null
+make -f YaneuraOu/source/Makefile -C engine TARGET_CPU=$ARCH YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE COMPILER=$COMP > /dev/null
 
 cd ../..
 mv ./YaneuraOu/source/YaneuraOu-by-gcc .
