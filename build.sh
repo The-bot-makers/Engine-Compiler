@@ -1,8 +1,6 @@
 #!/bin/bash
 
-ARCH=SSE42
-
-make main.cpp -f Makefile -C . TARGET_CPU=$ARCH YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE > /dev/null
+make -j 8 sse
 
 for filen in $(ls .);
 do
