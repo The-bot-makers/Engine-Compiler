@@ -1,40 +1,66 @@
-﻿//#include <iostream>
-//#include "bitboard.h"
-//#include "position.h"
-#include "search.h"
-#include "thread.h"
-#include "tt.h"
-#include "usi.h"
-#include "misc.h"
+/*
+  Apery, a USI shogi playing engine derived from Stockfish, a UCI chess playing engine.
+  Copyright (C) 2004-2008 Tord Romstad (Glaurung author)
+  Copyright (C) 2008-2015 Marco Costalba, Joona Kiiski, Tord Romstad
+  Copyright (C) 2015-2016 Marco Costalba, Joona Kiiski, Gary Linscott, Tord Romstad
+  Copyright (C) 2011-2016 Hiraoka Takuya
 
-// ----------------------------------------
-//  main()
-// ----------------------------------------
+  Apery is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
 
-int main(int argc, char* argv[])
-{
-	// --- 全体的な初期化
+  Apery is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
 
-	CommandLine::init(argc,argv);
-	USI::init(Options);
-	Bitboards::init();
-	Position::init();
-	Search::init();
+  You should have received a copy of the GNU General Public License
+  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
 
-	// エンジンオプションの"Threads"があるとは限らないので…。
-	size_t thread_num = Options.count("Threads") ? (size_t)Options["Threads"] : 1;
-	Threads.set(thread_num);
+#include "common.hpp"
+#include "bitboard.hpp"
+#include "init.hpp"
+#include "position.hpp"
+#include "usi.hpp"
+#include "thread.hpp"
+#include "tt.hpp"
+#include "search.hpp"
 
-	//Search::clear();
-	Eval::init();
+#if defined FIND_MAGIC
+// Magic Bitboard の Magic Number を求める為のソフト
+int main() {
+    u64 RookMagic[SquareNum];
+    u64 BishopMagic[SquareNum];
 
-	// USIコマンドの応答部
+    std::cout << "const u64 RookMagic[81] = {" << std::endl;
+    for (Square sq = SQ11; sq < SquareNum; ++sq) {
+        RookMagic[sq] = findMagic(sq, false);
+        std::cout << "\tUINT64_C(0x" << std::hex << RookMagic[sq] << ")," << std::endl;
+    }
+    std::cout << "};\n" << std::endl;
 
-	USI::loop(argc, argv);
+    std::cout << "const u64 BishopMagic[81] = {" << std::endl;
+    for (Square sq = SQ11; sq < SquareNum; ++sq) {
+        BishopMagic[sq] = findMagic(sq, true);
+        std::cout << "\tUINT64_C(0x" << std::hex << BishopMagic[sq] << ")," << std::endl;
+    }
+    std::cout << "};\n" << std::endl;
 
-	// 生成して、待機させていたスレッドの停止
-
-	Threads.set(0);
-
-	return 0;
+    return 0;
 }
+
+#else
+// 将棋を指すソフト
+int main(int argc, char* argv[]) {
+    initTable();
+    Position::initZobrist();
+    HuffmanCodedPos::init();
+    auto s = std::unique_ptr<Searcher>(new Searcher);
+    s->init();
+    s->doUSICommandLoop(argc, argv);
+    s->threads.exit();
+}
+
+#endif

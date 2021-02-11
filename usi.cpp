@@ -1,1119 +1,1142 @@
-﻿#include "types.h"
-#include "usi.h"
-#include "position.h"
-#include "search.h"
-#include "thread.h"
-#include "tt.h"
-
-#include <sstream>
-#include <queue>
-
-using namespace std;
-
-// ----------------------------------
-//      USI拡張コマンド "test"
-// ----------------------------------
-
-#if defined(ENABLE_TEST_CMD)
-
-// USI拡張コマンドのうち、開発上のテスト関係のコマンド。
-// 思考エンジンの実行には関係しない。
-
-namespace Test
-{
-	// 通常のテスト用コマンド。コマンドを処理した時 trueが返る。
-	bool normal_test_cmd(Position& pos, std::istringstream& is, const std::string& token);
-
-	// 詰み関係のテスト用コマンド。コマンドを処理した時 trueが返る。
-	bool mate_test_cmd(Position& pos, std::istringstream& is, const std::string& token);
-
-	void test_cmd(Position& pos, std::istringstream& is)
-	{
-		// 探索をするかも知れないので初期化しておく。
-		is_ready();
-
-		std::string token;
-		is >> token;
-
-		// デザパタのDecoratorの呼び出しみたいな感じで書いていく。
-
-		// 通常のテスト用コマンド
-		if (normal_test_cmd(pos, is, token))
-			return;
-
-		// 詰み関係のテスト用コマンド
-		if (mate_test_cmd(pos,is,token))
-			return;
-
-		sync_cout << "Error! : unknown command = " << token << sync_endl;
-	}
-
-}
-
-#endif // defined(ENABLE_TEST_CMD)
-
-
-//
-// あとで整理する
-//
-
-
-// ユーザーの実験用に開放している関数。
-// USI拡張コマンドで"user"と入力するとこの関数が呼び出される。
-// "user"コマンドの後続に指定されている文字列はisのほうに渡される。
-void user_test(Position& pos, std::istringstream& is);
-
-#if defined(ENABLE_TEST_CMD)
-	void generate_moves_cmd(Position& pos);
-#endif
-
-#if defined(USE_MATE_DFPN)
-// "mate"コマンド
-void mate_cmd(Position& pos, istream& is);
-#endif
-
-// ----------------------------------
-//      USI拡張コマンド "makebook"
-// ----------------------------------
-
-// 定跡を作るコマンド
-#if defined (ENABLE_MAKEBOOK_CMD) && defined(EVAL_LEARN)
-namespace Book { extern void makebook_cmd(Position& pos, istringstream& is); }
-#endif
-
-// ----------------------------------
-//      USI拡張コマンド "learn"
-// ----------------------------------
-
-// 棋譜を自動生成するコマンド
-#if defined (EVAL_LEARN)
-namespace Learner
-{
-  // 教師局面の自動生成
-  void gen_sfen(Position& pos, istringstream& is);
-
-  // 生成した棋譜からの学習
-  void learn(Position& pos, istringstream& is);
-
-#if defined(GENSFEN2019)
-  // 開発中の教師局面の自動生成コマンド
-  void gen_sfen2019(Position& pos, istringstream& is);
-#endif
-
-  // 読み筋と評価値のペア。Learner::search(),Learner::qsearch()が返す。
-  typedef std::pair<Value, std::vector<Move> > ValueAndPV;
-
-  ValueAndPV qsearch(Position& pos);
-  ValueAndPV search(Position& pos, int depth_, size_t multiPV = 1 , u64 nodesLimit = 0 );
-
-}
-#endif
-
-// ----------------------------------
-//      USI拡張コマンド "bench"
-// ----------------------------------
-
-// "bench"コマンドは、"test"コマンド群とは別。常に呼び出せるようにしてある。
-extern void bench_cmd(Position& pos, istringstream& is);
-
-
-// "gameover"コマンドに対するハンドラ
-#if defined(USE_GAMEOVER_HANDLER)
-void gameover_handler(const string& cmd);
-#endif
-
-
-namespace USI
-{
-	// --------------------
-	//    読み筋の出力
-	// --------------------
-
-	// depth : iteration深さ
-	std::string pv(const Position& pos, Depth depth, Value alpha, Value beta)
-	{
-		std::stringstream ss;
-		TimePoint elapsed = Time.elapsed() + 1;
-
-		const auto& rootMoves = pos.this_thread()->rootMoves;
-		size_t pvIdx = pos.this_thread()->pvIdx;
-		size_t multiPV = std::min((size_t)Options["MultiPV"], rootMoves.size());
-
-		uint64_t nodes_searched = Threads.nodes_searched();
-
-		// MultiPVでは上位N個の候補手と読み筋を出力する必要がある。
-		for (size_t i = 0; i < multiPV; ++i)
-		{
-			// この指し手のpvの更新が終わっているのか
-			bool updated = rootMoves[i].score != -VALUE_INFINITE;
-
-			if (depth == 1 && !updated && i > 0)
-				continue;
-
-			// 1より小さな探索depthで出力しない。
-			Depth d = updated ? depth : std::max(1, depth - 1);
-			Value v = updated ? rootMoves[i].score : rootMoves[i].previousScore;
-
-			// multi pv時、例えば3個目の候補手までしか評価が終わっていなくて(PVIdx==2)、このとき、
-			// 3,4,5個目にあるのは前回のiterationまでずっと評価されていなかった指し手であるような場合に、
-			// これらのpreviousScoreが-VALUE_INFINITE(未初期化状態)でありうる。
-			// (multi pv状態で"go infinite"～"stop"を繰り返すとこの現象が発生する。おそらく置換表にhitしまくる結果ではないかと思う。)
-			if (v == -VALUE_INFINITE)
-				v = VALUE_ZERO; // この場合でもとりあえず出力は行う。
-
-			//bool tb = TB::RootInTB && abs(v) < VALUE_MATE_IN_MAX_PLY;
-			//v = tb ? rootMoves[i].tbScore : v;
-
-			if (ss.rdbuf()->in_avail()) // 1行目でないなら連結のための改行を出力
-				ss << endl;
-
-			ss  << "info"
-				<< " depth "    << d
-				<< " seldepth " << rootMoves[i].selDepth
-#if defined(USE_PIECE_VALUE)
-				<< " score "    << USI::value(v)
-#endif				
-				;
-
-			// これが現在探索中の指し手であるなら、それがlowerboundかupperboundかは表示させる
-			if (i == pvIdx)
-				ss << (v >= beta ? " lowerbound" : v <= alpha ? " upperbound" : "");
-
-			// 将棋所はmultipvに対応していないが、とりあえず出力はしておく。
-			if (multiPV > 1)
-				ss << " multipv " << (i + 1);
-
-			ss << " nodes " << nodes_searched
-			   << " nps "   << nodes_searched * 1000 / elapsed;
-
-			// 置換表使用率。経過時間が短いときは意味をなさないので出力しない。
-			if (elapsed > 1000)
-				ss << " hashfull " << TT.hashfull();
-
-			ss << " time " << elapsed
-			   << " pv";
-
-
-			// PV配列からPVを出力する。
-			// ※　USIの"info"で読み筋を出力するときは"pv"サブコマンドはサブコマンドの一番最後にしなければならない。
-
-			auto out_array_pv = [&]()
-			{
-				for (Move m : rootMoves[i].pv)
-					ss << " " << m;
-			};
-
-			// 置換表からPVをかき集めてきてPVを出力する。
-			auto out_tt_pv = [&]()
-			{
-				auto pos_ = const_cast<Position*>(&pos);
-				Move moves[MAX_PLY + 1];
-				StateInfo si[MAX_PLY];
-				int ply = 0;
-
-				while ( ply < MAX_PLY )
-				{
-					// 千日手はそこで終了。ただし初手はPVを出力。
-					// 千日手がベストのとき、置換表を更新していないので
-					// 置換表上はMOVE_NONEがベストの指し手になっている可能性があるので早めに検出する。
-					auto rep = pos.is_repetition(ply);
-					if (rep != REPETITION_NONE && ply >= 1)
-					{
-						// 千日手でPVを打ち切るときはその旨を表示
-						ss << " " << rep;
-						break;
-					}
-
-					Move m;
-
-					// MultiPVを考慮して初手は置換表からではなくrootMovesから取得
-					// rootMovesには宣言勝ちも含まれるので注意。
-					if (ply == 0)
-						m = rootMoves[i].pv[0];
-					else
-					{
-						// 次の手を置換表から拾う。
-						// ただし置換表を破壊されるとbenchコマンドの時にシングルスレッドなのに探索内容の同一性が保証されなくて
-						// 困るのでread_probe()を用いる。
-						bool found;
-						auto* tte = TT.read_probe(pos.state()->key(), found);
-
-						// 置換表になかった
-						if (!found)
-							break;
-
-						m = pos.to_move(tte->move());
-
-						// 置換表にはpsudo_legalではない指し手が含まれるのでそれを弾く。
-						// 宣言勝ちでないならこれが合法手であるかのチェックが必要。
-						if (m != MOVE_WIN)
-						{
-							if (!(pos.pseudo_legal(m) && pos.legal(m)))
-								break;
-						}
-					}
-
-#if defined (USE_ENTERING_KING_WIN)
-					// 宣言勝ちである
-					if (m == MOVE_WIN)
-					{
-						// これが合法手であるなら宣言勝ちであると出力。
-						if (pos.DeclarationWin() != MOVE_NONE)
-							ss << " " << MOVE_WIN;
-
-						break;
-					}
-#endif
-
-					moves[ply] = m;
-					ss << " " << m;
-
-					pos_->do_move(m, si[ply]);
-					++ply;
-				}
-				while (ply > 0)
-					pos_->undo_move(moves[--ply]);
-			};
-
-			// 検討用のPVを出力するモードなら、置換表からPVをかき集める。
-			// (そうしないとMultiPV時にPVが欠損することがあるようだ)
-			// fail-highのときにもPVを更新しているのが問題ではなさそう。
-			// Stockfish側の何らかのバグかも。
-			if (Search::Limits.consideration_mode)
-				out_tt_pv();
-			else
-				out_array_pv();
-		}
-
-		return ss.str();
-	}
-}
-
-// --------------------
-// USI関係のコマンド処理
-// --------------------
-
-// check sumを計算したとき、それを保存しておいてあとで次回以降、整合性のチェックを行なう。
-u64 eval_sum;
-
-// is_ready_cmd()を外部から呼び出せるようにしておく。(benchコマンドなどから呼び出したいため)
-// 局面は初期化されないので注意。
-void is_ready(bool skipCorruptCheck)
-{
-
-	// --- Keep Alive的な処理 ---
-
-	// "isready"を受け取ったあと、"readyok"を返すまで5秒ごとに改行を送るように修正する。(keep alive的な処理)
-	// →　これ、よくない仕様であった。
-	// cf. USIプロトコルでisready後の初期化に時間がかかる時にどうすれば良いのか？
-	//     http://yaneuraou.yaneu.com/2020/01/05/usi%e3%83%97%e3%83%ad%e3%83%88%e3%82%b3%e3%83%ab%e3%81%a7isready%e5%be%8c%e3%81%ae%e5%88%9d%e6%9c%9f%e5%8c%96%e3%81%ab%e6%99%82%e9%96%93%e3%81%8c%e3%81%8b%e3%81%8b%e3%82%8b%e6%99%82%e3%81%ab%e3%81%a9/
-	// cf. isready後のkeep alive用改行コードの送信について
-	//		http://yaneuraou.yaneu.com/2020/03/08/isready%e5%be%8c%e3%81%aekeep-alive%e7%94%a8%e6%94%b9%e8%a1%8c%e3%82%b3%e3%83%bc%e3%83%89%e3%81%ae%e9%80%81%e4%bf%a1%e3%81%ab%e3%81%a4%e3%81%84%e3%81%a6/
-
-	// これを送らないと、将棋所、ShogiGUIでタイムアウトになりかねない。
-	// ワーカースレッドを一つ生成して、そいつが5秒おきに改行を送信するようにする。
-	// このあと重い処理を行うのでスレッドの起動が遅延する可能性があるから、先にスレッドを生成して、そのスレッドが起動したことを
-	// 確認してから処理を行う。
-
-	// スレッドが起動したことを通知するためのフラグ
-	auto thread_started = false;
-
-	// この関数を抜ける時に立つフラグ(スレッドを停止させる用)
-	auto thread_end = false;
-
-	// 定期的な改行送信用のスレッド
-	auto th = std::thread([&] {
-		// スレッドが起動した
-		thread_started = true;
-
-		int count = 0;
-		while (!thread_end)
-		{
-			std::this_thread::sleep_for(std::chrono::milliseconds(100));
-			if (++count >= 50 /* 5秒 */)
-			{
-				count = 0;
-				sync_cout << sync_endl; // 改行を送信する。	
-
-				// 定跡の読み込み部などで"info string.."で途中経過を出力する場合、
-				// sync_cout ～ sync_endlを用いて送信しないと、この改行を送るタイミングとかち合うと
-				// 変なところで改行されてしまうので注意。
-			}
-		}
-		});
-	SCOPE_EXIT({ thread_end = true; th.join(); });
-
-	// スレッド起動待ち
-	while (!thread_started)
-		Tools::sleep(100);
-
-	// --- Keep Alive的な処理ここまで ---
-
-	// スレッドを先に生成しないとUSI_Hashで確保したメモリクリアの並列化が行われなくて困る。
-
-#if defined(YANEURAOU_ENGINE_DEEP)
-
-	// ここ、max_gpu == 8固定として扱っている。あとで修正する。(かも)
-	int threads_num =
-		(int)Options["UCT_Threads1"] + (int)Options["UCT_Threads2"] + (int)Options["UCT_Threads3"] + (int)Options["UCT_Threads4"] +
-		(int)Options["UCT_Threads5"] + (int)Options["UCT_Threads6"] + (int)Options["UCT_Threads7"] + (int)Options["UCT_Threads8"];
-
-	Threads.set(std::max(threads_num,1));
-#else
-	Threads.set(size_t(Options["Threads"]));
-#endif
-
-#if defined (USE_EVAL_HASH)
-	Eval::EvalHash_Resize(Options["EvalHash"]);
-#endif
-
-	// 評価関数の読み込み
-
-#if defined(YANEURAOU_ENGINE_DEEP)
-
-	// 毎回、load_eval()は呼び出すものとする。
-	// モデルファイル名に変更がなければ、再読み込みされないような作りになっているならばこの実装のほうがシンプル。
-	Eval::load_eval();
-	USI::load_eval_finished = true;
-
-#else
-
-	// 評価関数の読み込みなど時間のかかるであろう処理はこのタイミングで行なう。
-	// 起動時に時間のかかる処理をしてしまうと将棋所がタイムアウト判定をして、思考エンジンとしての認識をリタイアしてしまう。
-	if (!USI::load_eval_finished)
-	{
-		// 評価関数の読み込み
-		Eval::load_eval();
-
-		// チェックサムの計算と保存(その後のメモリ破損のチェックのため)
-		eval_sum = Eval::calc_check_sum();
-
-		// ソフト名の表示
-		Eval::print_softname(eval_sum);
-
-		USI::load_eval_finished = true;
-	}
-	else
-	{
-		// メモリが破壊されていないかを調べるためにチェックサムを毎回調べる。
-		// 時間が少しもったいない気もするが.. 0.1秒ぐらいのことなので良しとする。
-		if (!skipCorruptCheck && eval_sum != Eval::calc_check_sum())
-			sync_cout << "Error! : EVAL memory is corrupted" << sync_endl;
-	}
-#endif
-
-	// isreadyに対してはreadyokを返すまで次のコマンドが来ないことは約束されているので
-	// このタイミングで各種変数の初期化もしておく。
-
-	TT.resize(size_t(Options["USI_Hash"]));
-
-	Search::clear();
-
-#if defined (USE_EVAL_HASH)
-	Eval::EvalHash_Clear();
-#endif
-
-	Threads.stop = false;
-}
-
-// isreadyコマンド処理部
-void is_ready_cmd(Position& pos, StateListPtr& states)
-{
-	// 対局ごとに"isready","usinewgame"の両方が来る。
-	// "isready"が起動後に1度だけしか来ないようなGUI実装は、
-	// 実装上の誤りであるから修正すべきである。)
-
-	// 少なくとも将棋のGUI(将棋所、ShogiGUI、将棋神やねうら王)では、
-	// "isready"が毎回来るようなので、"usinewgame"のほうは無視して、
-	// "isready"に応じて評価関数、定跡、探索部を初期化する。
-
-	is_ready();
-
-	// Positionコマンドが送られてくるまで評価値の全計算をしていないの気持ち悪いのでisreadyコマンドに対して
-	// evalの値を返せるようにこのタイミングで平手局面で初期化してしまう。
-
-	// 新しく渡す局面なので古いものは捨てて新しいものを作る。
-	states = StateListPtr(new StateList(1));
-	pos.set_hirate(&states->back(),Threads.main());
-
-	sync_cout << "readyok" << sync_endl;
-}
-
-// "position"コマンド処理部
-void position_cmd(Position& pos, istringstream& is , StateListPtr& states)
-{
-	Move m;
-	string token, sfen;
-
-	is >> token;
-
-	if (token == "startpos")
-	{
-		// 初期局面として初期局面のFEN形式の入力が与えられたとみなして処理する。
-		sfen = SFEN_HIRATE;
-		is >> token; // もしあるなら"moves"トークンを消費する。
-	}
-	// 局面がfen形式で指定されているなら、その局面を読み込む。
-	// UCI(チェスプロトコル)ではなくUSI(将棋用プロトコル)だとここの文字列は"fen"ではなく"sfen"
-	// この"sfen"という文字列は省略可能にしたいので..
-	else {
-		if (token != "sfen")
-			sfen += token + " ";
-		while (is >> token && token != "moves")
-			sfen += token + " ";
-	}
-
-	// 新しく渡す局面なので古いものは捨てて新しいものを作る。
-	states = StateListPtr(new StateList(1));
-	pos.set(sfen , &states->back() , Threads.main());
-
-	std::vector<Move> moves_from_game_root;
-
-	// 指し手のリストをパースする(あるなら)
-	while (is >> token && (m = USI::to_move(pos, token)) != MOVE_NONE)
-	{
-		// 1手進めるごとにStateInfoが積まれていく。これは千日手の検出のために必要。
-		states->emplace_back();
-		if (m == MOVE_NULL) // do_move に MOVE_NULL を与えると死ぬので
-			pos.do_null_move(states->back());
-		else
-			pos.do_move(m, states->back());
-
-		moves_from_game_root.emplace_back(m);
-	}
-
-	// やねうら王では、ここに保存しておくことになっている。
-	Threads.main()->game_root_sfen = sfen;
-	Threads.main()->moves_from_game_root = std::move(moves_from_game_root);
-}
-
-// "setoption"コマンド応答。
-void setoption_cmd(istringstream& is)
-{
-	string token, name, value;
-
-	while (is >> token && token != "value")
-		// "name"トークンはあってもなくても良いものとする。(手打ちでコマンドを打つときには省略したい)
-		if (token != "name")
-			// スペース区切りで長い名前のoptionを使うことがあるので2つ目以降はスペースを入れてやる
-			name += (name.empty() ? "" : " ") + token;
-
-	// valueの後ろ。スペース区切りで複数文字列が来ることがある。
-	while (is >> token)
-		value += (value.empty() ? "" : " ") + token;
-
-	if (Options.count(name))
-		Options[name] = value;
-	else
-		// この名前のoptionは存在しなかった
-		sync_cout << "Error! : No such option: " << name << sync_endl;
-
-}
-
-// getoptionコマンド応答(USI独自拡張)
-// オプションの値を取得する。
-void getoption_cmd(istringstream& is)
-{
-	// getoption オプション名
-	string name = "";
-	is >> name;
-
-	// すべてを出力するモード
-	bool all = name == "";
-
-	for (auto& o : Options)
-	{
-		// 大文字、小文字を無視して比較。また、nameが指定されていなければすべてのオプション設定の現在の値を表示。
-		if ((!StringExtension::stricmp(name, o.first)) || all)
-		{
-			sync_cout << "Options[" << o.first << "] == " << (string)Options[o.first] << sync_endl;
-			if (!all)
-				return;
-		}
-	}
-	if (!all)
-		sync_cout << "No such option: " << name << sync_endl;
-}
-
-
-// go()は、思考エンジンがUSIコマンドの"go"を受け取ったときに呼び出される。
-// この関数は、入力文字列から思考時間とその他のパラメーターをセットし、探索を開始する。
-void go_cmd(const Position& pos, istringstream& is , StateListPtr& states) {
-
-	// "isready"コマンド受信前に"go"コマンドが呼び出されている。
-	if (!USI::load_eval_finished)
-	{
-		sync_cout << "Error! go cmd before isready cmd." << sync_endl;
-		return;
-	}
-
-	Search::LimitsType limits;
-	string token;
-	bool ponderMode = false;
-
-	// 思考開始時刻の初期化。なるべく早い段階でこれをしておかないとサーバー時間との誤差が大きくなる。
-	Time.reset();
-
-	// 終局(引き分け)になるまでの手数
-	// 引き分けになるまでの手数。(Options["MaxMovesToDraw"]として与えられる。エンジンによってはこのオプションを持たないこともある。)
-	// 0のときは制限なしだが、これをINT_MAXにすると残り手数を計算するときに桁があふれかねないので100000を設定。
-
-	int max_game_ply = 0;
-	if (Options.count("MaxMovesToDraw"))
-		max_game_ply = (int)Options["MaxMovesToDraw"];
-	limits.max_game_ply = (max_game_ply == 0) ? 100000 : max_game_ply;
-
-#if defined (USE_ENTERING_KING_WIN)
-	// 入玉ルール
-	limits.enteringKingRule = to_entering_king_rule(Options["EnteringKingRule"]);
-#endif
-
-	// すべての合法手を生成するのか
-#if defined (USE_GENERATE_ALL_LEGAL_MOVES)
-	limits.generate_all_legal_moves = Options["GenerateAllLegalMoves"];
-#endif
-
-	// エンジンオプションによる探索制限(0なら無制限)
-	// このあと、depthもしくはnodesが指定されていたら、その値で上書きされる。(この値は無視される)
-	
-	limits.depth = Options.count("DepthLimit") ? (int)Options["DepthLimit"] : 0;
-	limits.nodes = Options.count("NodesLimit") ? (u64)Options["NodesLimit"] : 0;
-
-	while (is >> token)
-	{
-		// 探索すべき指し手。(探索開始局面から特定の初手だけ探索させるとき)
-		if (token == "searchmoves")
-			// 残りの指し手すべてをsearchMovesに突っ込む。
-			while (is >> token)
-				limits.searchmoves.push_back(USI::to_move(pos, token));
-
-		// 先手、後手の残り時間。[ms]
-		else if (token == "wtime")     is >> limits.time[WHITE];
-		else if (token == "btime")     is >> limits.time[BLACK];
-
-		// フィッシャールール時における時間
-		else if (token == "winc")      is >> limits.inc[WHITE];
-		else if (token == "binc")      is >> limits.inc[BLACK];
-
-		// "go rtime 100"だと100～300[ms]思考する。
-		else if (token == "rtime")     is >> limits.rtime;
-
-		// 秒読み設定。
-		else if (token == "byoyomi") {
-			TimePoint t = 0;
-			is >> t;
-
-			// USIプロトコルで送られてきた秒読み時間より少なめに思考する設定
-			// ※　通信ラグがあるときに、ここで少なめに思考しないとタイムアップになる可能性があるので。
-
-			// t = std::max(t - Options["ByoyomiMinus"], Time::point(0));
-
-			// USIプロトコルでは、これが先手後手同じ値だと解釈する。
-			limits.byoyomi[BLACK] = limits.byoyomi[WHITE] = t;
-		}
-		// この探索深さで探索を打ち切る
-		else if (token == "depth")     is >> limits.depth;
-
-		// この探索ノード数で探索を打ち切る
-		else if (token == "nodes")     is >> limits.nodes;
-
-		// 持ち時間固定(将棋だと対応しているGUIが無いかもしれないが..)
-		else if (token == "movetime")  is >> limits.movetime;
-
-		// 詰み探索。"UCI"プロトコルではこのあとには手数が入っており、その手数以内に詰むかどうかを判定するが、
-		// "USI"プロトコルでは、ここは探索のための時間制限に変更となっている。
-		else if (token == "mate") {
-			is >> token;
-			if (token == "infinite")
-				limits.mate = INT32_MAX;
-			else
-				// USIプロトコルでは、UCIと異なり、ここは手数ではなく、探索に使う時間[ms]が指定されている。
-				limits.mate = stoi(token);
-		}
-
-#if defined(TANUKI_MATE_ENGINE)
-		// MateEngineのデバッグ用コマンド: 詰将棋の特定の変化に対する解析を効率的に行うことが出来る。
-		//	cf.https ://github.com/yaneurao/YaneuraOu/pull/115
-
-		else if (token == "matedebug") {
-			string token="";
-			Move16 m;
-			limits.pv_check.clear();
-			while (is >> token && (m = USI::to_move16(token)) != MOVE_NONE){
-				limits.pv_check.push_back(m);
-			}
-		}
-#endif
-
-		// パフォーマンステスト(Stockfishにある、合法手N手で到達できる局面を求めるやつ)
-		// このあとposition～goコマンドを使うとパフォーマンステストモードに突入し、ここで設定した手数で到達できる局面数を求める
-		else if (token == "perft")		is >> limits.perft;
-
-		// 時間無制限。
-		else if (token == "infinite")	limits.infinite = 1;
-
-		// ponderモードでの思考。
-		else if (token == "ponder")		ponderMode = true;
-	}
-
-	// goコマンド、デバッグ時に使うが、そのときに"go btime XXX wtime XXX byoyomi XXX"と毎回入力するのが面倒なので
-	// デフォルトで1秒読み状態で呼び出されて欲しい。
-	if (limits.byoyomi[BLACK] == 0 && limits.inc[BLACK] == 0 && limits.time[BLACK] == 0 && limits.rtime == 0)
-		limits.byoyomi[BLACK] = limits.byoyomi[WHITE] = 1000;
-
-	Threads.start_thinking(pos, states , limits , ponderMode);
-}
-
-// --------------------
-// テスト用にqsearch(),search()を直接呼ぶ
-// --------------------
-
-#if defined(EVAL_LEARN)
-void qsearch_cmd(Position& pos)
-{
-	cout << "qsearch : ";
-	auto pv = Learner::qsearch(pos);
-	cout << "Value = " << pv.first << " , PV = ";
-	for (auto m : pv.second)
-		cout << m << " ";
-	cout << endl;
-}
-
-void search_cmd(Position& pos, istringstream& is)
-{
-	string token;
-	int depth = 1;
-	int multi_pv = (int)Options["MultiPV"];
-	while (is >> token)
-	{
-		if (token == "depth")
-			is >> depth;
-		if (token == "multipv")
-			is >> multi_pv;
-	}
-
-	cout << "search depth = " << depth << " , multi_pv = " << multi_pv << " : ";
-	auto pv = Learner::search(pos , depth , multi_pv);
-	cout << "Value = " << pv.first << " , PV = ";
-	for (auto m : pv.second)
-		cout << m << " ";
-	cout << endl;
-}
-
-#endif
-
-// --------------------
-// 　　USI応答部
-// --------------------
-
-// USI応答部本体
-void USI::loop(int argc, char* argv[])
-{
-	// 探索開始局面(root)を格納するPositionクラス
-	Position pos;
-
-	string cmd, token;
-
-	// 局面を遡るためのStateInfoのlist。
-	StateListPtr states(new StateList(1));
-
-	// 先行入力されているコマンド
-	// コマンドは前から取り出すのでqueueを用いる。
-	queue<string> cmds;
-
-	// ファイルからコマンドの指定
-	if (argc >= 3 && string(argv[1]) == "file")
-	{
-		vector<string> cmds0;
-		FileOperator::ReadAllLines(argv[2], cmds0);
-
-		// queueに変換する。
-		for (auto c : cmds0)
-			cmds.push(c);
-
-	} else {
-
-		// 引数として指定されたものを一つのコマンドとして実行する機能
-		// ただし、','が使われていれば、そこでコマンドが区切れているものとして解釈する。
-
-		for (int i = 1; i < argc; ++i)
-		{
-			string s = argv[i];
-
-			// sから前後のスペースを除去しないといけない。
-			while (*s.rbegin() == ' ') s.pop_back();
-			while (*s.begin() == ' ') s = s.substr(1, s.size() - 1);
-
-			if (s != ",")
-				cmd += s + " ";
-			else
-			{
-				cmds.push(cmd);
-				cmd = "";
-			}
-		}
-		if (cmd.size() != 0)
-			cmds.push(cmd);
-	}
-
-	do
-	{
-		if (cmds.size() == 0)
-		{
-			if (!std::getline(cin, cmd)) // 入力が来るかEOFがくるまでここで待機する。
-				cmd = "quit";
-		} else {
-			// 積んであるコマンドがあるならそれを実行する。
-			// 尽きれば"quit"だと解釈してdoループを抜ける仕様にすることはできるが、
-			// そうしてしまうとgoコマンド(これはノンブロッキングなので)の最中にquitが送られてしまう。
-			// ただ、
-			// YaneuraOu-mid.exe bench,quit
-			// のようなことは出来るのでPGOの役には立ちそうである。
-			cmd = cmds.front();
-			cmds.pop();
-		}
-
-		istringstream is(cmd);
-
-		token.clear(); // getlineが空を返したときのためのクリア
-		is >> skipws >> token;
-
-		if (token == "quit" || token == "stop" || token == "gameover")
-		{
-			// USIプロトコルにはUCIプロトコルから、
-			// gameover win | lose | draw
-			// が追加されているが、stopと同じ扱いをして良いと思う。
-			// これハンドルしておかないとponderが停止しなくて困る。
-			// gameoverに対してbestmoveは返すべきではないのかも知れないが、
-			// それを言えばstopにだって…。
-
-#if defined(USE_GAMEOVER_HANDLER)
-			// "gameover"コマンドに対するハンドラを呼び出したいのか？
-			if (token == "gameover")
-				gameover_handler(cmd);
-#endif
-
-			// "go infinite" , "go ponder"などで思考を終えて寝てるかも知れないが、
-			// そいつらはThreads.stopを待っているので問題ない。
-			Threads.stop = true;
-
-		} else if (token == "ponderhit")
-		{
-			Time.reset_for_ponderhit(); // ponderhitから計測しなおすべきである。
-			Threads.main()->ponder = false; // 通常探索に切り替える。
-		}
-
-		// 起動時いきなりこれが飛んでくるので速攻応答しないとタイムアウトになる。
-		else if (token == "usi")
-			sync_cout << engine_info() << Options << "usiok" << sync_endl;
-
-		// オプションを設定する
-		else if (token == "setoption") setoption_cmd(is);
-
-		// 与えられた局面について思考するコマンド
-		else if (token == "go") go_cmd(pos, is , states);
-
-		// (思考などに使うための)開始局面(root)を設定する
-		else if (token == "position") position_cmd(pos, is , states);
-
-		// "usinewgame"はゲーム中にsetoptionなどを送らないことを宣言するためのものだが、
-		// 我々はこれに関知しないので単に無視すれば良い。
-		// やねうら王では、時間のかかる初期化はisreadyの応答でやっている。
-		// Stockfishでは、Search::clear() (時間のかかる処理)をここで呼び出しているようだが。
-		// そもそもで言うと、"usinewgame"に対してはエンジン側は何ら応答を返さないので、
-		// GUI側は、エンジン側が処理中なのかどうかが判断できない。
-		// なのでここで長い時間のかかる処理はすべきではないと思うのだが。
-		else if (token == "usinewgame") continue;
-
-		// 思考エンジンの準備が出来たかの確認
-		else if (token == "isready") is_ready_cmd(pos,states);
-
-		// 以下、デバッグのためのカスタムコマンド(非USIコマンド)
-		// 探索中には使わないようにすべし。
-
-#if defined(USER_ENGINE)
-		// ユーザーによる実験用コマンド。user.cppのuser()が呼び出される。
-		else if (token == "user") user_test(pos, is);
-#endif
-
-		// ベンチコマンド(これは常に使える)
-		else if (token == "bench") bench_cmd(pos, is);
-
-		// 現在の局面を表示する。(デバッグ用)
-		else if (token == "d") cout << pos << endl;
-
-		// 現在の局面について評価関数を呼び出して、その値を返す。
-		else if (token == "eval") cout << "eval = " << Eval::compute_eval(pos) << endl;
-		else if (token == "evalstat") Eval::print_eval_stat(pos);
-
-		// この実行ファイルをコンパイルしたコンパイラの情報を出力する。
-		else if (token == "compiler") sync_cout << compiler_info() << sync_endl;
-
-		// -- 以下、やねうら王独自拡張のカスタムコマンド
-
-		// オプションを取得する(USI独自拡張)
-		else if (token == "getoption") getoption_cmd(is);
-
-		// 指し手生成祭りの局面をセットする。
-		else if (token == "matsuri") pos.set("l6nl/5+P1gk/2np1S3/p1p4Pp/3P2Sp1/1PPb2P1P/P5GS1/R8/LN4bKL w GR5pnsg 1", &states->back(), Threads.main());
-
-		// "position sfen"の略。
-		else if (token == "sfen") position_cmd(pos, is, states);
-
-		// ログファイルの書き出しのon
-		else if (token == "log") start_logger(true);
-
-#if defined(EVAL_LEARN)
-		// テスト用にqsearch(),search()を直接呼ぶコマンド
-		else if (token == "qsearch") qsearch_cmd(pos);
-		else if (token == "search") search_cmd(pos,is);
-#endif
-
-		// この局面での指し手をすべて出力
-		else if (token == "moves") {
-			for (auto m : MoveList<LEGAL_ALL>(pos))
-				cout << m.move << ' ';
-			cout << endl;
-		}
-
-		// この局面の手番側がどちらであるかを返す。BLACK or WHITE
-		else if (token == "side") cout << (pos.side_to_move() == BLACK ? "black":"white") << endl;
-
-		// この局面が詰んでいるかの判定
-		else if (token == "mated") cout << pos.is_mated() << endl;
-
-		// この局面のhash keyの値を出力
-		else if (token == "key") cout << hex << pos.state()->key() << dec << endl;
-
-#if defined(MATE_1PLY) && defined(LONG_EFFECT_LIBRARY)
-		// この局面での1手詰め判定
-		else if (token == "mate1") cout << pos.mate1ply() << endl;
-#endif
-		
-#if defined (ENABLE_TEST_CMD)
-		// テストコマンド
-		else if (token == "test") Test::test_cmd(pos, is);
-#endif
-
-#if defined (ENABLE_MAKEBOOK_CMD) && defined(EVAL_LEARN)
-		// 定跡を作るコマンド
-		else if (token == "makebook") Book::makebook_cmd(pos, is);
-#endif
-
-#if defined (EVAL_LEARN)
-		else if (token == "gensfen") Learner::gen_sfen(pos, is);
-		else if (token == "learn") Learner::learn(pos, is);
-
-#if defined (GENSFEN2019)
-		// 開発中の教師局面生成コマンド
-		else if (token == "gensfen2019") Learner::gen_sfen2019(pos, is);
-#endif
-
-#endif
-
-		else
-		{
-			//    簡略表現として、
-			//> threads 1
-			//      のように指定したとき、
-			//> setoption name Threads value 1
-			//      と等価なようにしておく。
-
-			if (!token.empty())
-			{
-				string value;
-				is >> value;
-
-				for (auto& o : Options)
-				{
-					// 大文字、小文字を無視して比較。
-					if (!StringExtension::stricmp(token, o.first))
-					{
-						Options[o.first] = value;
-						sync_cout << "Options[" << o.first << "] = " << value << sync_endl;
-
-						goto OPTION_FOUND;
-					}
-				}
-				sync_cout << "No such option: " << token << sync_endl;
-			OPTION_FOUND:;
-			}
-		}
-
-	} while (token != "quit");
-
-	// quitが来た時点ではまだ探索中かも知れないのでmain threadの停止を待つ。
-	Threads.main()->wait_for_search_finished();
-}
-
-// --------------------
-// USI関係の記法変換部
-// --------------------
+/*
+  Apery, a USI shogi playing engine derived from Stockfish, a UCI chess playing engine.
+  Copyright (C) 2004-2008 Tord Romstad (Glaurung author)
+  Copyright (C) 2008-2015 Marco Costalba, Joona Kiiski, Tord Romstad
+  Copyright (C) 2015-2016 Marco Costalba, Joona Kiiski, Gary Linscott, Tord Romstad
+  Copyright (C) 2011-2017 Hiraoka Takuya
+
+  Apery is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  Apery is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#include "usi.hpp"
+#include "position.hpp"
+#include "move.hpp"
+#include "movePicker.hpp"
+#include "generateMoves.hpp"
+#include "search.hpp"
+#include "tt.hpp"
+#include "book.hpp"
+#include "thread.hpp"
+#include "benchmark.hpp"
+#include "learner.hpp"
 
 namespace {
-	// USIの指し手文字列などに使われている盤上の升を表す文字列をSquare型に変換する
-	// 変換できなかった場合はSQ_NBが返る。高速化のために用意した。
-	Square usi_to_sq(char f, char r)
-	{
-		File file = toFile(f);
-		Rank rank = toRank(r);
-
-		if (is_ok(file) && is_ok(rank))
-			return file | rank;
-
-		return SQ_NB;
-	}
+    void onThreads(Searcher* s, const USIOption&)      { s->threads.readUSIOptions(s); }
+    void onHashSize(Searcher* s, const USIOption& opt) { s->tt.resize(opt); }
+    void onClearHash(Searcher* s, const USIOption&)    { s->tt.clear(); }
 }
 
-#if defined(USE_PIECE_VALUE)
-// スコアを歩の価値を100として正規化して出力する。
-// USE_PIECE_VALUEが定義されていない時は正規化しようがないのでこの関数は呼び出せない。
-std::string USI::value(Value v)
+bool CaseInsensitiveLess::operator () (const std::string& s1, const std::string& s2) const {
+    for (size_t i = 0; i < s1.size() && i < s2.size(); ++i) {
+        const int c1 = tolower(s1[i]);
+        const int c2 = tolower(s2[i]);
+        if (c1 != c2)
+            return c1 < c2;
+    }
+    return s1.size() < s2.size();
+}
+
+namespace {
+    // 論理的なコア数の取得
+    inline int cpuCoreCount() {
+        // std::thread::hardware_concurrency() は 0 を返す可能性がある。
+        // HyperThreading が有効なら論理コア数だけ thread 生成した方が強い。
+        return std::max(static_cast<int>(std::thread::hardware_concurrency()), 1);
+    }
+
+    class StringToPieceTypeCSA : public std::map<std::string, PieceType> {
+    public:
+        StringToPieceTypeCSA() {
+            (*this)["FU"] = Pawn;
+            (*this)["KY"] = Lance;
+            (*this)["KE"] = Knight;
+            (*this)["GI"] = Silver;
+            (*this)["KA"] = Bishop;
+            (*this)["HI"] = Rook;
+            (*this)["KI"] = Gold;
+            (*this)["OU"] = King;
+            (*this)["TO"] = ProPawn;
+            (*this)["NY"] = ProLance;
+            (*this)["NK"] = ProKnight;
+            (*this)["NG"] = ProSilver;
+            (*this)["UM"] = Horse;
+            (*this)["RY"] = Dragon;
+        }
+        PieceType value(const std::string& str) const {
+            return this->find(str)->second;
+        }
+        bool isLegalString(const std::string& str) const {
+            return (this->find(str) != this->end());
+        }
+    };
+    const StringToPieceTypeCSA g_stringToPieceTypeCSA;
+}
+
+void OptionsMap::init(Searcher* s) {
+    const int MaxHashMB = 1024 * 1024;
+    (*this)["USI_Hash"]                    = USIOption(256, 1, MaxHashMB, onHashSize, s);
+    (*this)["Clear_Hash"]                  = USIOption(onClearHash, s);
+    (*this)["Book_File"]                   = USIOption("book/20150503/book.bin");
+    (*this)["Eval_Dir"]                    = USIOption("20161007");
+    (*this)["Best_Book_Move"]              = USIOption(false);
+    (*this)["OwnBook"]                     = USIOption(true);
+    (*this)["Min_Book_Ply"]                = USIOption(SHRT_MAX, 0, SHRT_MAX);
+    (*this)["Max_Book_Ply"]                = USIOption(SHRT_MAX, 0, SHRT_MAX);
+    (*this)["Min_Book_Score"]              = USIOption(-180, -ScoreInfinite, ScoreInfinite);
+    (*this)["USI_Ponder"]                  = USIOption(true);
+    (*this)["Byoyomi_Margin"]              = USIOption(500, 0, INT_MAX);
+    (*this)["Time_Margin"]                 = USIOption(4500, 0, INT_MAX);
+    (*this)["MultiPV"]                     = USIOption(1, 1, MaxLegalMoves);
+    (*this)["Max_Random_Score_Diff"]       = USIOption(0, 0, ScoreMate0Ply);
+    (*this)["Max_Random_Score_Diff_Ply"]   = USIOption(SHRT_MAX, 0, SHRT_MAX);
+    (*this)["Slow_Mover_10"]               = USIOption(10, 1, 1000); // 持ち時間15分, 秒読み10秒では10, 持ち時間2時間では3にした。(sdt4)
+    (*this)["Slow_Mover_16"]               = USIOption(20, 1, 1000); // 持ち時間15分, 秒読み10秒では50, 持ち時間2時間では20にした。(sdt4)
+    (*this)["Slow_Mover_20"]               = USIOption(40, 1, 1000); // 持ち時間15分, 秒読み10秒では50, 持ち時間2時間では40にした。(sdt4)
+    (*this)["Slow_Mover"]                  = USIOption(89, 1, 1000);
+    (*this)["Draw_Ply"]                    = USIOption(256, 1, INT_MAX);
+    (*this)["Move_Overhead"]               = USIOption(30, 0, 5000);
+    (*this)["Minimum_Thinking_Time"]       = USIOption(20, 0, INT_MAX);
+    (*this)["Threads"]                     = USIOption(cpuCoreCount(), 1, MaxThreads, onThreads, s);
+#ifdef NDEBUG
+    (*this)["Engine_Name"]                 = USIOption("elmo");
+#else
+    (*this)["Engine_Name"]                 = USIOption("elmo Debug Build");
+#endif
+}
+
+USIOption::USIOption(const char* v, Fn* f, Searcher* s) :
+    type_("string"), min_(0), max_(0), onChange_(f), searcher_(s)
 {
-	ASSERT_LV3(-VALUE_INFINITE < v && v < VALUE_INFINITE);
+    defaultValue_ = currentValue_ = v;
+}
 
-	std::stringstream s;
+USIOption::USIOption(const bool v, Fn* f, Searcher* s) :
+    type_("check"), min_(0), max_(0), onChange_(f), searcher_(s)
+{
+    defaultValue_ = currentValue_ = (v ? "true" : "false");
+}
 
-	// 置換表上、値が確定していないことがある。
-	if (v == VALUE_NONE)
-		s << "none";
-	else if (abs(v) < VALUE_MATE_IN_MAX_PLY)
-		s << "cp " << v * 100 / int(Eval::PawnValue);
-	else if (v == -VALUE_MATE)
-		// USIプロトコルでは、手数がわからないときには "mate -"と出力するらしい。
-		// 手数がわからないというか詰んでいるのだが…。これを出力する方法がUSIプロトコルで定められていない。
-		// ここでは"-0"を出力しておく。
-		// ※　ShogiGUIだと、これで"+詰"と出力されるようである。
-		s << "mate -0";
-	else
-		s << "mate " << (v > 0 ? VALUE_MATE - v : -VALUE_MATE - v);
+USIOption::USIOption(Fn* f, Searcher* s) :
+    type_("button"), min_(0), max_(0), onChange_(f), searcher_(s) {}
 
-	return s.str();
+USIOption::USIOption(const int v, const int min, const int max, Fn* f, Searcher* s)
+    : type_("spin"), min_(min), max_(max), onChange_(f), searcher_(s)
+{
+    std::ostringstream ss;
+    ss << v;
+    defaultValue_ = currentValue_ = ss.str();
+}
+
+USIOption& USIOption::operator = (const std::string& v) {
+    assert(!type_.empty());
+
+    if ((type_ != "button" && v.empty())
+        || (type_ == "check" && v != "true" && v != "false")
+        || (type_ == "spin" && (atoi(v.c_str()) < min_ || max_ < atoi(v.c_str()))))
+    {
+        return *this;
+    }
+
+    if (type_ != "button")
+        currentValue_ = v;
+
+    if (onChange_ != nullptr)
+        (*onChange_)(searcher_, *this);
+
+    return *this;
+}
+
+std::ostream& operator << (std::ostream& os, const OptionsMap& om) {
+    for (auto& elem : om) {
+        const USIOption& o = elem.second;
+        os << "\noption name " << elem.first << " type " << o.type_;
+        if (o.type_ != "button")
+            os << " default " << o.defaultValue_;
+
+        if (o.type_ == "spin")
+            os << " min " << o.min_ << " max " << o.max_;
+    }
+    return os;
+}
+
+void go(const Position& pos, std::istringstream& ssCmd) {
+    LimitsType limits;
+    std::string token;
+
+    limits.startTime.restart();
+
+    while (ssCmd >> token) {
+        if      (token == "ponder"     ) limits.ponder = true;
+        else if (token == "btime"      ) ssCmd >> limits.time[Black];
+        else if (token == "wtime"      ) ssCmd >> limits.time[White];
+        else if (token == "binc"       ) ssCmd >> limits.inc[Black];
+        else if (token == "winc"       ) ssCmd >> limits.inc[White];
+        else if (token == "infinite"   ) limits.infinite = true;
+        else if (token == "byoyomi" || token == "movetime") ssCmd >> limits.moveTime;
+        else if (token == "mate"       ) ssCmd >> limits.mate;
+        else if (token == "depth"      ) ssCmd >> limits.depth;
+        else if (token == "nodes"      ) ssCmd >> limits.nodes;
+        else if (token == "searchmoves") {
+            while (ssCmd >> token)
+                limits.searchmoves.push_back(usiToMove(pos, token));
+        }
+    }
+    if      (limits.moveTime != 0)
+        limits.moveTime -= pos.searcher()->options["Byoyomi_Margin"];
+    else if (pos.searcher()->options["Time_Margin"] != 0)
+        limits.time[pos.turn()] -= pos.searcher()->options["Time_Margin"];
+    pos.searcher()->threads.startThinking(pos, limits, pos.searcher()->states);
+}
+
+#if defined LEARN
+// 学習用。通常の go 呼び出しは文字列を扱って高コストなので、大量に探索の開始、終了を行う学習では別の呼び出し方にする。
+void go(const Position& pos, const Ply depth, const Move move) {
+    LimitsType limits;
+    limits.depth = depth;
+    limits.searchmoves.push_back(move);
+    pos.searcher()->threads.startThinking(pos, limits, pos.searcher()->states);
+    pos.searcher()->threads.main()->waitForSearchFinished();
+}
+void go(const Position& pos, const Ply depth) {
+    LimitsType limits;
+    limits.depth = depth;
+    pos.searcher()->threads.startThinking(pos, limits, pos.searcher()->states);
+    pos.searcher()->threads.main()->waitForSearchFinished();
 }
 #endif
 
-// Square型をUSI文字列に変換する
-std::string USI::square(Square s) {
-	return std::string{ char('a' + file_of(s)), char('1' + rank_of(s)) };
+// 評価値 x を勝率にして返す。
+// 係数 600 は Ponanza で採用しているらしい値。
+inline double sigmoidWinningRate(const double x) {
+    return 1.0 / (1.0 + exp(-x/600.0));
+}
+inline double dsigmoidWinningRate(const double x) {
+    const double a = 1.0/600;
+    return a * sigmoidWinningRate(x) * (1 - sigmoidWinningRate(x));
 }
 
-// 指し手をUSI文字列に変換する。
-std::string USI::move(Move   m) { return move(Move16(m)); }
-std::string USI::move(Move16 m)
-{
-	std::stringstream ss;
-	if (!is_ok(m))
-	{
-		ss << ((m == MOVE_RESIGN) ? "resign" :
-			   (m == MOVE_WIN)    ? "win" :
-			   (m == MOVE_NULL)   ? "null" :
-			   (m == MOVE_NONE)   ? "none" :
-			    "");
-	}
-	else if (is_drop(m))
-	{
-		ss << move_dropped_piece(m);
-		ss << '*';
-		ss << to_sq(m);
-	}
-	else {
-		ss << from_sq(m);
-		ss << to_sq(m);
-		if (is_promote(m))
-			ss << '+';
-	}
-	return ss.str();
+// 学習でqsearchだけ呼んだ時のPVを取得する為の関数。
+// RootMoves が存在しない為、別の関数とする。
+template <bool Undo> // 局面を戻し、moves に PV を書き込むなら true。末端の局面に移動したいだけなら false
+bool extractPVFromTT(Position& pos, Move* moves, const Move bestMove) {
+    StateInfo state[MaxPly+7];
+    StateInfo* st = state;
+    TTEntry* tte;
+    Ply ply = 0;
+    Move m;
+    bool ttHit;
+
+    tte = pos.csearcher()->tt.probe(pos.getKey(), ttHit);
+    //if (ttHit && move16toMove(tte->move(), pos) != bestMove)
+    //    return false; // 教師の手と異なる手の場合は学習しないので false。手が無い時は学習するので true
+    while (ttHit
+           && pos.moveIsPseudoLegal(m = move16toMove(tte->move(), pos))
+           && pos.pseudoLegalMoveIsLegal<false, false>(m, pos.pinnedBB())
+           && ply < MaxPly
+           && (!pos.isDraw(20) || ply < 6))
+    {
+        if (Undo)
+            *moves++ = m;
+        pos.doMove(m, *st++);
+        ++ply;
+        tte = pos.csearcher()->tt.probe(pos.getKey(), ttHit);
+    }
+    if (Undo) {
+        *moves++ = Move::moveNone();
+        while (ply)
+            pos.undoMove(*(--moves));
+    }
+    return true;
 }
 
-// 読み筋をUSI文字列化して返す。
-// " 7g7f 8c8d" のように返る。
-std::string USI::move(const std::vector<Move>& moves)
-{
-	std::ostringstream oss;
-	for (const auto& move : moves) {
-		oss << " " << move;
-	}
-	return oss.str();
+template <bool Undo>
+bool qsearch(Position& pos, const u16 bestMove16) {
+    //static std::atomic<int> i;
+    //StateInfo st;
+    Move pv[MaxPly+1];
+    Move moves[MaxPly+1];
+    SearchStack stack[MaxPly+7];
+    SearchStack* ss = stack + 5;
+    memset(ss-5, 0, 8 * sizeof(SearchStack));
+    (ss-1)->staticEvalRaw.p[0][0] = (ss+0)->staticEvalRaw.p[0][0] = ScoreNotEvaluated;
+    ss->pv = pv;
+    // 探索の末端がrootと同じ手番に偏るのを防ぐ為に一手進めて探索してみる。
+    //if ((i++ & 1) == 0) {
+    //  const Move bestMove = move16toMove(Move(bestMove16), pos);
+    //  pos.doMove(bestMove, st);
+    //}
+    if (pos.inCheck())
+        pos.searcher()->qsearch<PV, true >(pos, ss, -ScoreInfinite, ScoreInfinite, Depth0);
+    else
+        pos.searcher()->qsearch<PV, false>(pos, ss, -ScoreInfinite, ScoreInfinite, Depth0);
+    const Move bestMove = move16toMove(Move(bestMove16), pos);
+    // pv 取得
+    return extractPVFromTT<Undo>(pos, moves, bestMove);
 }
 
+#if defined USE_GLOBAL
+#else
+// 教師局面を増やす為、適当に駒を動かす。玉の移動を多めに。王手が掛かっている時は呼ばない事にする。
+void randomMove(Position& pos, std::mt19937& mt) {
+    StateInfo state[MaxPly+7];
+    StateInfo* st = state;
+    const Color us = pos.turn();
+    const Color them = oppositeColor(us);
+    const Square from = pos.kingSquare(us);
+    std::uniform_int_distribution<int> dist(0, 1);
+    switch (dist(mt)) {
+    case 0: { // 玉の25近傍の移動
+        ExtMove legalMoves[MaxLegalMoves]; // 玉の移動も含めた普通の合法手
+        ExtMove* pms = &legalMoves[0];
+        Bitboard kingToBB = pos.bbOf(us).notThisAnd(neighbor5x5Table(from));
+        while (kingToBB) {
+            const Square to = kingToBB.firstOneFromSQ11();
+            const Move move = makeNonPromoteMove<Capture>(King, from, to, pos);
+            if (pos.moveIsPseudoLegal<false>(move)
+                && pos.pseudoLegalMoveIsLegal<true, false>(move, pos.pinnedBB()))
+            {
+                (*pms++).move = move;
+            }
+        }
+        if (&legalMoves[0] != pms) { // 手があったなら
+            std::uniform_int_distribution<int> moveDist(0, pms - &legalMoves[0] - 1);
+            pos.doMove(legalMoves[moveDist(mt)].move, *st++);
+            if (dist(mt)) { // 1/2 の確率で相手もランダムに指す事にする。
+                MoveList<LegalAll> ml(pos);
+                if (ml.size()) {
+                    std::uniform_int_distribution<int> moveDist(0, ml.size()-1);
+                    pos.doMove((ml.begin() + moveDist(mt))->move, *st++);
+                }
+            }
+        }
+        else
+            return;
+        break;
+    }
+    case 1: { // 玉も含めた全ての合法手
+        bool moved = false;
+        for (int i = 0; i < dist(mt) + 1; ++i) { // 自分だけ、または両者ランダムに1手指してみる。
+            MoveList<LegalAll> ml(pos);
+            if (ml.size()) {
+                std::uniform_int_distribution<int> moveDist(0, ml.size()-1);
+                pos.doMove((ml.begin() + moveDist(mt))->move, *st++);
+                moved = true;
+            }
+        }
+        if (!moved)
+            return;
+        break;
+    }
+    default: UNREACHABLE;
+    }
 
-// 局面posとUSIプロトコルによる指し手を与えて
-// もし可能なら等価で合法な指し手を返す。(合法でないときはMOVE_NONEを返す)
-Move USI::to_move(const Position& pos, const std::string& str)
-{
-	// 全合法手のなかからusi文字列に変換したときにstrと一致する指し手を探してそれを返す
-	//for (const ExtMove& ms : MoveList<LEGAL_ALL>(pos))
-	//  if (str == move_to_usi(ms.move))
-	//    return ms.move;
+    // 違法手が混ざったりするので、一旦 sfen に直して読み込み、過去の手を参照しないようにする。
+    std::string sfen = pos.toSFEN();
+    std::istringstream ss(sfen);
+    setPosition(pos, ss);
+}
+// 教師局面を作成する。100万局面で34MB。
+void make_teacher(std::istringstream& ssCmd) {
+    std::string recordFileName;
+    std::string outputFileName;
+    int threadNum;
+    s64 teacherNodes; // 教師局面数
+    ssCmd >> recordFileName;
+    ssCmd >> outputFileName;
+    ssCmd >> threadNum;
+    ssCmd >> teacherNodes;
+    if (threadNum <= 0) {
+        std::cerr << "Error: thread num = " << threadNum << std::endl;
+        exit(EXIT_FAILURE);
+    }
+    if (teacherNodes <= 0) {
+        std::cerr << "Error: teacher nodes = " << teacherNodes << std::endl;
+        exit(EXIT_FAILURE);
+    }
+    std::vector<Searcher> searchers(threadNum);
+    std::vector<Position> positions;
+    for (auto& s : searchers) {
+        s.init();
+        const std::string options[] = {"name Threads value 1",
+                                       "name MultiPV value 1",
+                                       "name USI_Hash value 256",
+                                       "name OwnBook value false",
+                                       "name Max_Random_Score_Diff value 0"};
+        for (auto& str : options) {
+            std::istringstream is(str);
+            s.setOption(is);
+        }
+        positions.emplace_back(DefaultStartPositionSFEN, s.threads.main(), s.thisptr);
+    }
+    std::ifstream ifs(recordFileName.c_str(), std::ifstream::in | std::ifstream::binary | std::ios::ate);
+    if (!ifs) {
+        std::cerr << "Error: cannot open " << recordFileName << std::endl;
+        exit(EXIT_FAILURE);
+    }
+    const size_t entryNum = ifs.tellg() / sizeof(HuffmanCodedPos);
+    std::uniform_int_distribution<s64> inputFileDist(0, entryNum-1);
 
-	// ↑のコードは大変美しいコードではあるが、棋譜を大量に読み込むときに時間がかかるうるのでもっと高速な実装をする。
+    Mutex imutex;
+    Mutex omutex;
+    std::ofstream ofs(outputFileName.c_str(), std::ios::binary);
+    if (!ofs) {
+        std::cerr << "Error: cannot open " << outputFileName << std::endl;
+        exit(EXIT_FAILURE);
+    }
+    auto func = [&omutex, &ofs, &imutex, &ifs, &inputFileDist, &teacherNodes](Position& pos, std::atomic<s64>& idx, const int threadID) {
+        std::mt19937 mt(std::chrono::system_clock::now().time_since_epoch().count() + threadID);
+        std::uniform_real_distribution<double> doRandomMoveDist(0.0, 1.0);
+        HuffmanCodedPos hcp;
+        while (idx < teacherNodes) {
+            {
+                std::unique_lock<Mutex> lock(imutex);
+                ifs.seekg(inputFileDist(mt) * sizeof(HuffmanCodedPos), std::ios_base::beg);
+                ifs.read(reinterpret_cast<char*>(&hcp), sizeof(hcp));
+            }
+            setPosition(pos, hcp);
+            randomMove(pos, mt); // 教師局面を増やす為、取得した元局面からランダムに動かしておく。
+	    for(int i=0; i< 5 ; ++i) // tkzw: N(6)回ランダムムーブ、もう少し大きい方が良いと考えています。
+		if (!pos.inCheck()) // tkzw: 「王手じゃないという条件」は不要かもしれません。
+		    randomMove(pos, mt);
+		else break;
+            std::unordered_set<Key> keyHash;
+            StateListPtr states = StateListPtr(new std::deque<StateInfo>(1));
+            std::vector<HuffmanCodedPosAndEval> hcpevec;
+            GameResult gameResult = Draw;
+            for (Ply ply = pos.gamePly(); ply < 400; ++ply, ++idx) { // 400 手くらいで終了しておく。
+                const Key key = pos.getKey();
+                if (keyHash.find(key) == std::end(keyHash))
+                    keyHash.insert(key);
+                else { // 同一局面 2 回目で千日手判定とする。
+                    gameResult = Draw;
+                    break;
+                }
+                pos.searcher()->alpha = -ScoreMaxEvaluate;
+                pos.searcher()->beta  =  ScoreMaxEvaluate;
+                go(pos, static_cast<Depth>(6));
+                const Score score = pos.searcher()->threads.main()->rootMoves[0].score;
+                const Move bestMove = pos.searcher()->threads.main()->rootMoves[0].pv[0];
+                const int ScoreThresh = 3000; // 自己対局を決着がついたとして止める閾値
+                if (ScoreThresh < abs(score)) { // 差が付いたので投了した事にする。
+                    if (pos.turn() == Black)
+                        gameResult = (score < ScoreZero ? WhiteWin : BlackWin);
+                    else
+                        gameResult = (score < ScoreZero ? BlackWin : WhiteWin);
+                    break;
+                }
+                else if (!bestMove) { // 勝ち宣言
+                    gameResult = (pos.turn() == Black ? BlackWin : WhiteWin);
+                    break;
+                }
 
-	if (str == "resign")
-		return MOVE_RESIGN;
+                {
+                    hcpevec.emplace_back(HuffmanCodedPosAndEval());
+                    HuffmanCodedPosAndEval& hcpe = hcpevec.back();
+                    hcpe.hcp = pos.toHuffmanCodedPos();
+                    auto& pv = pos.searcher()->threads.main()->rootMoves[0].pv;
+                    const Color rootTurn = pos.turn();
+                    StateInfo state[MaxPly+7];
+                    StateInfo* st = state;
+                    for (size_t i = 0; i < pv.size(); ++i)
+                        pos.doMove(pv[i], *st++);
+                    // evaluate() の差分計算を無効化する。
+                    SearchStack ss[2];
+                    ss[0].staticEvalRaw.p[0][0] = ss[1].staticEvalRaw.p[0][0] = ScoreNotEvaluated;
+                    const Score eval = evaluate(pos, ss+1);
+                    // root の手番から見た評価値に直す。
+                    hcpe.eval = (rootTurn == pos.turn() ? eval : -eval);
+                    hcpe.bestMove16 = static_cast<u16>(pv[0].value());
 
-	if (str == "win")
-		return MOVE_WIN;
+                    for (size_t i = pv.size(); i > 0;)
+                        pos.undoMove(pv[--i]);
+                }
 
-	// パス(null move)入力への対応 {UCI: "0000", GPSfish: "pass"}
-	if (str == "0000" || str == "null" || str == "pass")
-		return MOVE_NULL;
+                states->push_back(StateInfo());
+                pos.doMove(bestMove, states->back());
+            }
+            // 勝敗を1局全てに付ける。
+            for (auto& elem : hcpevec)
+                elem.gameResult = gameResult;
+            std::unique_lock<Mutex> lock(omutex);
+            ofs.write(reinterpret_cast<char*>(hcpevec.data()), sizeof(HuffmanCodedPosAndEval) * hcpevec.size());
+        }
+    };
+    auto progressFunc = [&teacherNodes] (std::atomic<s64>& index, Timer& t) {
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(5)); // 指定秒だけ待機し、進捗を表示する。
+            const s64 madeTeacherNodes = index;
+            const double progress = static_cast<double>(madeTeacherNodes) / teacherNodes;
+            auto elapsed_msec = t.elapsed();
+            if (progress > 0.0) // 0 除算を回避する。
+                std::cout << std::fixed << "Progress: " << std::setprecision(2) << std::min(100.0, progress * 100.0)
+                          << "%, Elapsed: " << elapsed_msec/1000
+                          << "[s], Remaining: " << std::max<s64>(0, elapsed_msec*(1.0 - progress)/(progress*1000)) << "[s]" << std::endl;
+            if (index >= teacherNodes)
+                break;
+        }
+    };
+    std::atomic<s64> index;
+    index = 0;
+    Timer t = Timer::currentTime();
+    std::vector<std::thread> threads(threadNum);
+    for (int i = 0; i < threadNum; ++i)
+        threads[i] = std::thread([&positions, &index, i, &func] { func(positions[i], index, i); });
+    std::thread progressThread([&index, &progressFunc, &t] { progressFunc(index, t); });
+    for (int i = 0; i < threadNum; ++i)
+        threads[i].join();
+    progressThread.join();
 
-	// usi文字列を高速にmoveに変換するやつがいるがな..
-	Move move = pos.to_move(USI::to_move16(str));
+    std::cout << "Made " << teacherNodes << " teacher nodes in " << t.elapsed()/1000 << " seconds." << std::endl;
+}
 
-#if defined(MUST_CAPTURE_SHOGI_ENGINE)
-	// 取る一手将棋は合法手かどうかをGUI側でチェックしてくれないから、
-	// 合法手かどうかのチェックを入れる。
-	if (!MoveList<LEGAL>(pos).contains(move))
-		sync_cout << "info string Error!! Illegal Move = " << move << sync_endl;
+namespace {
+    // Learner とほぼ同じもの。todo: Learner と共通化する。
+
+    using LowerDimensionedEvaluatorGradient = EvaluatorBase<std::array<std::atomic<double>, 2>,
+                                                            std::array<std::atomic<double>, 2>,
+                                                            std::array<std::atomic<double>, 2> >;
+    using EvalBaseType = EvaluatorBase<std::array<double, 2>,
+                                       std::array<double, 2>,
+                                       std::array<double, 2> >;
+
+    // 小数の評価値を round して整数に直す。
+    void copyEval(Evaluator& eval, EvalBaseType& evalBase) {
+#if defined _OPENMP
+#pragma omp parallel
+#endif
+#ifdef _OPENMP
+#pragma omp for
+#endif
+        for (size_t i = 0; i < eval.kpps_end_index(); ++i)
+            for (int boardTurn = 0; boardTurn < 2; ++boardTurn)
+                (*eval.oneArrayKPP(i))[boardTurn] = round((*evalBase.oneArrayKPP(i))[boardTurn]);
+#ifdef _OPENMP
+#pragma omp for
+#endif
+        for (size_t i = 0; i < eval.kkps_end_index(); ++i)
+            for (int boardTurn = 0; boardTurn < 2; ++boardTurn)
+                (*eval.oneArrayKKP(i))[boardTurn] = round((*evalBase.oneArrayKKP(i))[boardTurn]);
+#ifdef _OPENMP
+#pragma omp for
+#endif
+        for (size_t i = 0; i < eval.kks_end_index(); ++i)
+            for (int boardTurn = 0; boardTurn < 2; ++boardTurn)
+                (*eval.oneArrayKK(i))[boardTurn] = round((*evalBase.oneArrayKK(i))[boardTurn]);
+    }
+    // 整数の評価値を小数に直す。
+    void copyEval(EvalBaseType& evalBase, Evaluator& eval) {
+#if defined _OPENMP
+#pragma omp parallel
+#endif
+#ifdef _OPENMP
+#pragma omp for
+#endif
+        for (size_t i = 0; i < evalBase.kpps_end_index(); ++i)
+            for (int boardTurn = 0; boardTurn < 2; ++boardTurn)
+                (*evalBase.oneArrayKPP(i))[boardTurn] = (*eval.oneArrayKPP(i))[boardTurn];
+#ifdef _OPENMP
+#pragma omp for
+#endif
+        for (size_t i = 0; i < evalBase.kkps_end_index(); ++i)
+            for (int boardTurn = 0; boardTurn < 2; ++boardTurn)
+                (*evalBase.oneArrayKKP(i))[boardTurn] = (*eval.oneArrayKKP(i))[boardTurn];
+#ifdef _OPENMP
+#pragma omp for
+#endif
+        for (size_t i = 0; i < evalBase.kks_end_index(); ++i)
+            for (int boardTurn = 0; boardTurn < 2; ++boardTurn)
+                (*evalBase.oneArrayKK(i))[boardTurn] = (*eval.oneArrayKK(i))[boardTurn];
+    }
+    void averageEval(EvalBaseType& averagedEvalBase, EvalBaseType& evalBase) {
+        constexpr double AverageDecay = 0.8; // todo: 過去のデータの重みが強すぎる可能性あり。
+#if defined _OPENMP
+#pragma omp parallel
+#endif
+#ifdef _OPENMP
+#pragma omp for
+#endif
+        for (size_t i = 0; i < averagedEvalBase.kpps_end_index(); ++i)
+            for (int boardTurn = 0; boardTurn < 2; ++boardTurn)
+                (*averagedEvalBase.oneArrayKPP(i))[boardTurn] = AverageDecay * (*averagedEvalBase.oneArrayKPP(i))[boardTurn] + (1.0 - AverageDecay) * (*evalBase.oneArrayKPP(i))[boardTurn];
+#ifdef _OPENMP
+#pragma omp for
+#endif
+        for (size_t i = 0; i < averagedEvalBase.kkps_end_index(); ++i)
+            for (int boardTurn = 0; boardTurn < 2; ++boardTurn)
+                (*averagedEvalBase.oneArrayKKP(i))[boardTurn] = AverageDecay * (*averagedEvalBase.oneArrayKKP(i))[boardTurn] + (1.0 - AverageDecay) * (*evalBase.oneArrayKKP(i))[boardTurn];
+#ifdef _OPENMP
+#pragma omp for
+#endif
+        for (size_t i = 0; i < averagedEvalBase.kks_end_index(); ++i)
+            for (int boardTurn = 0; boardTurn < 2; ++boardTurn)
+                (*averagedEvalBase.oneArrayKK(i))[boardTurn] = AverageDecay * (*averagedEvalBase.oneArrayKK(i))[boardTurn] + (1.0 - AverageDecay) * (*evalBase.oneArrayKK(i))[boardTurn];
+    }
+    constexpr double FVPenalty() { return (0.001/static_cast<double>(FVScale)); }
+    // RMSProp(実質、改造してAdaGradになっている) でパラメータを更新する。
+    template <typename T>
+    void updateFV(std::array<T, 2>& v, const std::array<std::atomic<double>, 2>& grad, std::array<std::atomic<double>, 2>& msGrad, std::atomic<double>& max) {
+        //constexpr double AttenuationRate = 0.99999;
+        constexpr double UpdateParam = 30.0; // 更新用のハイパーパラメータ。大きいと不安定になり、小さいと学習が遅くなる。 tkzw:小さめが良い
+        constexpr double epsilon = 0.000001; // 0除算防止の定数
+
+        for (int i = 0; i < 2; ++i) {
+            // ほぼAdaGrad
+            msGrad[i] = /*AttenuationRate * */msGrad[i] + /*(1.0 - AttenuationRate) * */grad[i] * grad[i];
+            const double updateStep = UpdateParam * grad[i] / sqrt(msGrad[i] + epsilon);
+            v[i] += updateStep;
+            const double fabsmax = fabs(updateStep);
+            if (max < fabsmax)
+                max = fabsmax;
+        }
+    }
+    void updateEval(EvalBaseType& evalBase,
+                    LowerDimensionedEvaluatorGradient& lowerDimentionedEvaluatorGradient,
+                    LowerDimensionedEvaluatorGradient& meanSquareOfLowerDimensionedEvaluatorGradient)
+    {
+        std::atomic<double> max;
+        max = 0.0;
+#if defined _OPENMP
+#pragma omp parallel
+#endif
+#ifdef _OPENMP
+#pragma omp for
+#endif
+        for (size_t i = 0; i < evalBase.kpps_end_index(); ++i)
+            updateFV(*evalBase.oneArrayKPP(i), *lowerDimentionedEvaluatorGradient.oneArrayKPP(i), *meanSquareOfLowerDimensionedEvaluatorGradient.oneArrayKPP(i), max);
+#ifdef _OPENMP
+#pragma omp for
+#endif
+        for (size_t i = 0; i < evalBase.kkps_end_index(); ++i)
+            updateFV(*evalBase.oneArrayKKP(i), *lowerDimentionedEvaluatorGradient.oneArrayKKP(i), *meanSquareOfLowerDimensionedEvaluatorGradient.oneArrayKKP(i), max);
+#ifdef _OPENMP
+#pragma omp for
+#endif
+        for (size_t i = 0; i < evalBase.kks_end_index(); ++i)
+            updateFV(*evalBase.oneArrayKK(i), *lowerDimentionedEvaluatorGradient.oneArrayKK(i), *meanSquareOfLowerDimensionedEvaluatorGradient.oneArrayKK(i), max);
+
+        std::cout << "max update step : " << std::fixed << std::setprecision(2) << max << std::endl;
+    }
+}
+
+constexpr s64 NodesPerIteration = 1000000; // 1回評価値を更新するのに使う教師局面数
+
+void use_teacher(Position& pos, std::istringstream& ssCmd) {
+    std::string teacherFileName;
+    int threadNum;
+    ssCmd >> teacherFileName;
+    ssCmd >> threadNum;
+    if (threadNum <= 0)
+        exit(EXIT_FAILURE);
+    std::vector<Searcher> searchers(threadNum);
+    std::vector<Position> positions;
+    // std::vector<TriangularEvaluatorGradient> だと、非常に大きな要素が要素数分メモリ上に連続する必要があり、
+    // 例えメモリ量が余っていても、連続で確保出来ない場合は bad_alloc してしまうので、unordered_map にする。
+    std::unordered_map<int, std::unique_ptr<TriangularEvaluatorGradient> > evaluatorGradients;
+    // evaluatorGradients(threadNum) みたいにコンストラクタで確保するとスタックを使い切って落ちたので emplace_back する。
+    for (int i = 0; i < threadNum; ++i)
+        evaluatorGradients.emplace(i, std::move(std::unique_ptr<TriangularEvaluatorGradient>(new TriangularEvaluatorGradient)));
+    for (auto& s : searchers) {
+        s.init();
+        const std::string options[] = {"name Threads value 1",
+                                       "name MultiPV value 1",
+                                       "name USI_Hash value 256",
+                                       "name OwnBook value false",
+                                       "name Max_Random_Score_Diff value 0"};
+        for (auto& str : options) {
+            std::istringstream is(str);
+            s.setOption(is);
+        }
+        positions.emplace_back(DefaultStartPositionSFEN, s.threads.main(), s.thisptr);
+    }
+    if (teacherFileName == "-") // "-" なら棋譜ファイルを読み込まない。
+        exit(EXIT_FAILURE);
+    std::ifstream ifs(teacherFileName.c_str(), std::ios::binary);
+    if (!ifs)
+        exit(EXIT_FAILURE);
+
+    Mutex mutex;
+    auto func = [&mutex, &ifs](Position& pos, TriangularEvaluatorGradient& evaluatorGradient, double& loss, std::atomic<s64>& nodes) {
+        SearchStack ss[2];
+        HuffmanCodedPosAndEval hcpe;
+        evaluatorGradient.clear();
+        pos.searcher()->tt.clear();
+        while (true) {
+            {
+                std::unique_lock<Mutex> lock(mutex);
+                if (NodesPerIteration < nodes++)
+                    return;
+                ifs.read(reinterpret_cast<char*>(&hcpe), sizeof(hcpe));
+                if (ifs.eof())
+                    return;
+            }
+	    if( hcpe.gameResult == Draw ) continue; // 引き分けは今のところ使わない
+            auto setpos = [](HuffmanCodedPosAndEval& hcpe, Position& pos) {
+                setPosition(pos, hcpe.hcp);
+            };
+            setpos(hcpe, pos);
+            const Color rootColor = pos.turn();
+            pos.searcher()->alpha = -ScoreMaxEvaluate;
+            pos.searcher()->beta  =  ScoreMaxEvaluate;
+            if (!qsearch<false>(pos, hcpe.bestMove16)) // 末端の局面に移動する。
+                continue;
+            // pv を辿って評価値を返す。pos は pv を辿る為に状態が変わる。
+            auto pvEval = [&ss, &rootColor](Position& pos) {
+                ss[0].staticEvalRaw.p[0][0] = ss[1].staticEvalRaw.p[0][0] = ScoreNotEvaluated;
+                // evaluate() は手番側から見た点数なので、eval は rootColor から見た点数。
+                const Score eval = (rootColor == pos.turn() ? evaluate(pos, ss+1) : -evaluate(pos, ss+1));
+                return eval;
+            };
+            const Score eval = pvEval(pos);
+            const Score teacherEval = static_cast<Score>(hcpe.eval); // root から見た評価値が入っている。
+            const Color leafColor = pos.turn(); // pos は末端の局面になっている。
+	    const double eval_winrate = sigmoidWinningRate(eval);
+	    const double teacher_winrate = sigmoidWinningRate(teacherEval);
+	    double t = -1; // tkzw: 勝っていれば1, 負けていれば0
+	    if( rootColor == Black ){
+		if( hcpe.gameResult == BlackWin )
+		    t = 1.0;
+		else if( hcpe.gameResult == WhiteWin )
+		    t = 0.0;
+	    }
+	    else{
+		if( hcpe.gameResult == BlackWin )
+		    t = 0.0;
+		else if( hcpe.gameResult == WhiteWin )
+		    t = 1.0;
+	    }
+	    const double LAMBDA = 0.5; // tkzw: 適当に変えてください。WCSC27は0.5で実行しています。
+            const double dsig = (eval_winrate -t) + LAMBDA * (eval_winrate - teacher_winrate);
+            const double tmp = -1 * ( log( eval_winrate/(1-eval_winrate) ) ) \
+				+ LAMBDA * (-teacher_winrate*log(eval_winrate) - (1-teacher_winrate)*log(1-eval_winrate));
+            loss += tmp; // tkzw: lossの計算は不要なので通常、上の行とこの行はコメントアウトして使っています。
+            std::array<double, 2> dT = {{(rootColor == Black ? -dsig : dsig), (rootColor == leafColor ? -dsig : dsig)}};
+            evaluatorGradient.incParam(pos, dT);
+        }
+    };
+
+    auto lowerDimensionedEvaluatorGradient = std::unique_ptr<LowerDimensionedEvaluatorGradient>(new LowerDimensionedEvaluatorGradient);
+    auto meanSquareOfLowerDimensionedEvaluatorGradient = std::unique_ptr<LowerDimensionedEvaluatorGradient>(new LowerDimensionedEvaluatorGradient); // 過去の gradient の mean square (二乗総和)
+    auto evalBase = std::unique_ptr<EvalBaseType>(new EvalBaseType); // double で保持した評価関数の要素。相対位置などに分解して保持する。
+    auto averagedEvalBase = std::unique_ptr<EvalBaseType>(new EvalBaseType); // ファイル保存する際に評価ベクトルを平均化したもの。
+    auto eval = std::unique_ptr<Evaluator>(new Evaluator); // 整数化した評価関数。相対位置などに分解して保持する。
+    eval->init(pos.searcher()->options["Eval_Dir"], false);
+    copyEval(*evalBase, *eval); // 小数に直してコピー。
+    memcpy(averagedEvalBase.get(), evalBase.get(), sizeof(EvalBaseType));
+    const size_t fileSize = static_cast<size_t>(ifs.seekg(0, std::ios::end).tellg());
+    ifs.clear(); // 読み込み完了をクリアする。
+    ifs.seekg(0, std::ios::beg); // ストリームポインタを先頭に戻す。
+    const s64 MaxNodes = fileSize / sizeof(HuffmanCodedPosAndEval);
+    std::atomic<s64> nodes(0); // 今回のイテレーションで読み込んだ学習局面数。
+    auto writeEval = [&] {
+        // ファイル保存
+        copyEval(*eval, *averagedEvalBase); // 平均化した物を整数の評価値にコピー
+        //copyEval(*eval, *evalBase); // 平均化せずに整数の評価値にコピー
+        std::cout << "write eval ... " << std::flush;
+        eval->write(pos.searcher()->options["Eval_Dir"]);
+        std::cout << "done" << std::endl;
+    };
+    // 平均化していない合成後の評価関数バイナリも出力しておく。
+    auto writeSyn = [&] {
+        std::ofstream((Evaluator::addSlashIfNone(pos.searcher()->options["Eval_Dir"]) + "KPP_synthesized.bin").c_str()).write((char*)Evaluator::KPP, sizeof(Evaluator::KPP));
+        std::ofstream((Evaluator::addSlashIfNone(pos.searcher()->options["Eval_Dir"]) + "KKP_synthesized.bin").c_str()).write((char*)Evaluator::KKP, sizeof(Evaluator::KKP));
+        std::ofstream((Evaluator::addSlashIfNone(pos.searcher()->options["Eval_Dir"]) + "KK_synthesized.bin" ).c_str()).write((char*)Evaluator::KK , sizeof(Evaluator::KK ));
+    };
+    Timer t;
+    // 教師データ全てから学習した時点で終了する。
+    for (s64 iteration = 0; NodesPerIteration * iteration + nodes <= MaxNodes; ++iteration) {
+        t.restart();
+        nodes = 0;
+        std::cout << "iteration: " << iteration << ", nodes: " << NodesPerIteration * iteration + nodes << "/" << MaxNodes
+                  << " (" << std::fixed << std::setprecision(2) << static_cast<double>(NodesPerIteration * iteration + nodes) * 100 / MaxNodes << "%)" << std::endl;
+        std::vector<std::thread> threads(threadNum);
+        std::vector<double> losses(threadNum, 0.0);
+        for (int i = 0; i < threadNum; ++i)
+            threads[i] = std::thread([&positions, i, &func, &evaluatorGradients, &losses, &nodes] { func(positions[i], *(evaluatorGradients[i]), losses[i], nodes); });
+        for (int i = 0; i < threadNum; ++i)
+            threads[i].join();
+        if (nodes < NodesPerIteration)
+            break; // パラメータ更新するにはデータが足りなかったので、パラメータ更新せずに終了する。
+
+        for (size_t size = 1; size < (size_t)threadNum; ++size)
+            *(evaluatorGradients[0]) += *(evaluatorGradients[size]); // 複数スレッドで個別に保持していた gradients を [0] の要素に集約する。
+        lowerDimensionedEvaluatorGradient->clear();
+        lowerDimension(*lowerDimensionedEvaluatorGradient, *(evaluatorGradients[0]));
+
+        updateEval(*evalBase, *lowerDimensionedEvaluatorGradient, *meanSquareOfLowerDimensionedEvaluatorGradient);
+        averageEval(*averagedEvalBase, *evalBase); // 平均化する。
+        // if (iteration < 10) // 最初は値の変動が大きいので適当に変動させないでおく。tkzw:追加学習前提なので不要
+        //    memset(&(*evalBase), 0, sizeof(EvalBaseType));
+        if (iteration % 100 == 0 && iteration > 0) { // tkzw: iteration==0を除外
+            writeEval();
+            writeSyn();
+        }
+        copyEval(*eval, *evalBase); // 整数の評価値にコピー
+        eval->init(pos.searcher()->options["Eval_Dir"], false, false); // 探索で使う評価関数の更新
+        g_evalTable.clear(); // 評価関数のハッシュテーブルも更新しないと、これまで探索した評価値と矛盾が生じる。
+        std::cout << "iteration elapsed: " << t.elapsed() / 1000 << "[sec]" << std::endl;
+        std::cout << "loss: " << std::accumulate(std::begin(losses), std::end(losses), 0.0) << std::endl;
+        printEvalTable(SQ88, f_gold + SQ78, f_gold, false);
+    }
+    writeEval();
+    writeSyn();
+}
+
+// 教師データが壊れていないかチェックする。
+// todo: 教師データがたまに壊れる原因を調べる。
+void check_teacher(std::istringstream& ssCmd) {
+    std::string teacherFileName;
+    int threadNum;
+    ssCmd >> teacherFileName;
+    ssCmd >> threadNum;
+    if (threadNum <= 0)
+        exit(EXIT_FAILURE);
+    std::vector<Searcher> searchers(threadNum);
+    std::vector<Position> positions;
+    for (auto& s : searchers) {
+        s.init();
+        positions.emplace_back(DefaultStartPositionSFEN, s.threads.main(), s.thisptr);
+    }
+    std::ifstream ifs(teacherFileName.c_str(), std::ios::binary);
+    if (!ifs)
+        exit(EXIT_FAILURE);
+    Mutex mutex;
+    auto func = [&mutex, &ifs](Position& pos) {
+        HuffmanCodedPosAndEval hcpe;
+        while (true) {
+            {
+                std::unique_lock<Mutex> lock(mutex);
+                ifs.read(reinterpret_cast<char*>(&hcpe), sizeof(hcpe));
+                if (ifs.eof())
+                    return;
+            }
+            if (!setPosition(pos, hcpe.hcp))
+                exit(EXIT_FAILURE);
+        }
+    };
+    std::vector<std::thread> threads(threadNum);
+    for (int i = 0; i < threadNum; ++i)
+        threads[i] = std::thread([&positions, i, &func] { func(positions[i]); });
+    for (int i = 0; i < threadNum; ++i)
+        threads[i].join();
+    exit(EXIT_SUCCESS);
+}
 #endif
 
-	if (pos.pseudo_legal(move) && pos.legal(move))
-		return move;
+Move usiToMoveBody(const Position& pos, const std::string& moveStr) {
+    Move move;
+    if (g_charToPieceUSI.isLegalChar(moveStr[0])) {
+        // drop
+        const PieceType ptTo = pieceToPieceType(g_charToPieceUSI.value(moveStr[0]));
+        if (moveStr[1] != '*')
+            return Move::moveNone();
+        const File toFile = charUSIToFile(moveStr[2]);
+        const Rank toRank = charUSIToRank(moveStr[3]);
+        if (!isInSquare(toFile, toRank))
+            return Move::moveNone();
+        const Square to = makeSquare(toFile, toRank);
+        move = makeDropMove(ptTo, to);
+    }
+    else {
+        const File fromFile = charUSIToFile(moveStr[0]);
+        const Rank fromRank = charUSIToRank(moveStr[1]);
+        if (!isInSquare(fromFile, fromRank))
+            return Move::moveNone();
+        const Square from = makeSquare(fromFile, fromRank);
+        const File toFile = charUSIToFile(moveStr[2]);
+        const Rank toRank = charUSIToRank(moveStr[3]);
+        if (!isInSquare(toFile, toRank))
+            return Move::moveNone();
+        const Square to = makeSquare(toFile, toRank);
+        if (moveStr[4] == '\0')
+            move = makeNonPromoteMove<Capture>(pieceToPieceType(pos.piece(from)), from, to, pos);
+        else if (moveStr[4] == '+') {
+            if (moveStr[5] != '\0')
+                return Move::moveNone();
+            move = makePromoteMove<Capture>(pieceToPieceType(pos.piece(from)), from, to, pos);
+        }
+        else
+            return Move::moveNone();
+    }
 
-	// いかなる状況であろうとこのような指し手はエラー表示をして弾いていいと思うが…。
-	// cout << "\nIlligal Move : " << str << "\n";
-
-	return MOVE_NONE;
+    if (pos.moveIsPseudoLegal<false>(move)
+        && pos.pseudoLegalMoveIsLegal<false, false>(move, pos.pinnedBB()))
+    {
+        return move;
+    }
+    return Move::moveNone();
+}
+#if !defined NDEBUG
+// for debug
+Move usiToMoveDebug(const Position& pos, const std::string& moveStr) {
+    for (MoveList<LegalAll> ml(pos); !ml.end(); ++ml) {
+        if (moveStr == ml.move().toUSI())
+            return ml.move();
+    }
+    return Move::moveNone();
+}
+Move csaToMoveDebug(const Position& pos, const std::string& moveStr) {
+    for (MoveList<LegalAll> ml(pos); !ml.end(); ++ml) {
+        if (moveStr == ml.move().toCSA())
+            return ml.move();
+    }
+    return Move::moveNone();
+}
+#endif
+Move usiToMove(const Position& pos, const std::string& moveStr) {
+    const Move move = usiToMoveBody(pos, moveStr);
+    assert(move == usiToMoveDebug(pos, moveStr));
+    return move;
 }
 
+Move csaToMoveBody(const Position& pos, const std::string& moveStr) {
+    if (moveStr.size() != 6)
+        return Move::moveNone();
+    const File toFile = charCSAToFile(moveStr[2]);
+    const Rank toRank = charCSAToRank(moveStr[3]);
+    if (!isInSquare(toFile, toRank))
+        return Move::moveNone();
+    const Square to = makeSquare(toFile, toRank);
+    const std::string ptToString(moveStr.begin() + 4, moveStr.end());
+    if (!g_stringToPieceTypeCSA.isLegalString(ptToString))
+        return Move::moveNone();
+    const PieceType ptTo = g_stringToPieceTypeCSA.value(ptToString);
+    Move move;
+    if (moveStr[0] == '0' && moveStr[1] == '0')
+        // drop
+        move = makeDropMove(ptTo, to);
+    else {
+        const File fromFile = charCSAToFile(moveStr[0]);
+        const Rank fromRank = charCSAToRank(moveStr[1]);
+        if (!isInSquare(fromFile, fromRank))
+            return Move::moveNone();
+        const Square from = makeSquare(fromFile, fromRank);
+        PieceType ptFrom = pieceToPieceType(pos.piece(from));
+        if (ptFrom == ptTo)
+            // non promote
+            move = makeNonPromoteMove<Capture>(ptFrom, from, to, pos);
+        else if (ptFrom + PTPromote == ptTo)
+            // promote
+            move = makePromoteMove<Capture>(ptFrom, from, to, pos);
+        else
+            return Move::moveNone();
+    }
 
-// USI形式から指し手への変換。本来この関数は要らないのだが、
-// 棋譜を大量に読み込む都合、この部分をそこそこ高速化しておきたい。
-// やねうら王、独自追加。
-Move16 USI::to_move16(const string& str)
-{
-	Move16 move = MOVE_NONE;
+    if (pos.moveIsPseudoLegal<false>(move)
+        && pos.pseudoLegalMoveIsLegal<false, false>(move, pos.pinnedBB()))
+    {
+        return move;
+    }
+    return Move::moveNone();
+}
+Move csaToMove(const Position& pos, const std::string& moveStr) {
+    const Move move = csaToMoveBody(pos, moveStr);
+    assert(move == csaToMoveDebug(pos, moveStr));
+    return move;
+}
 
-	{
-		// さすがに3文字以下の指し手はおかしいだろ。
-		if (str.length() <= 3)
-			goto END;
+void setPosition(Position& pos, std::istringstream& ssCmd) {
+    std::string token;
+    std::string sfen;
 
-		Square to = usi_to_sq(str[2], str[3]);
-		if (!is_ok(to))
-			goto END;
+    ssCmd >> token;
 
-		bool promote = str.length() == 5 && str[4] == '+';
-		bool drop = str[1] == '*';
+    if (token == "startpos") {
+        sfen = DefaultStartPositionSFEN;
+        ssCmd >> token; // "moves" が入力されるはず。
+    }
+    else if (token == "sfen") {
+        while (ssCmd >> token && token != "moves")
+            sfen += token + " ";
+    }
+    else
+        return;
 
-		if (!drop)
-		{
-			Square from = usi_to_sq(str[0], str[1]);
-			if (is_ok(from))
-				move = promote ? make_move_promote16(from, to) : make_move16(from, to);
-		}
-		else
-		{
-			for (int i = 1; i <= 7; ++i)
-				if (PieceToCharBW[i] == str[0])
-				{
-					move = make_move_drop16((PieceType)i, to);
-					break;
-				}
-		}
-	}
+    pos.set(sfen, pos.searcher()->threads.main());
+    pos.searcher()->states = StateListPtr(new std::deque<StateInfo>(1));
 
-END:
-	return move;
+    Ply currentPly = pos.gamePly();
+    while (ssCmd >> token) {
+        const Move move = usiToMove(pos, token);
+        if (!move) break;
+        pos.searcher()->states->push_back(StateInfo());
+        pos.doMove(move, pos.searcher()->states->back());
+        ++currentPly;
+    }
+    pos.setStartPosPly(currentPly);
+}
+
+bool setPosition(Position& pos, const HuffmanCodedPos& hcp) {
+    return pos.set(hcp, pos.searcher()->threads.main());
+}
+
+void Searcher::setOption(std::istringstream& ssCmd) {
+    std::string token;
+    std::string name;
+    std::string value;
+
+    ssCmd >> token; // "name" が入力されるはず。
+
+    ssCmd >> name;
+    // " " が含まれた名前も扱う。
+    while (ssCmd >> token && token != "value")
+        name += " " + token;
+
+    ssCmd >> value;
+    // " " が含まれた値も扱う。
+    while (ssCmd >> token)
+        value += " " + token;
+
+    if (!options.isLegalOption(name))
+        std::cout << "No such option: " << name << std::endl;
+    else
+        options[name] = value;
+}
+
+#if !defined MINIMUL
+// for debug
+// 指し手生成の速度を計測
+void measureGenerateMoves(const Position& pos) {
+    pos.print();
+
+    ExtMove legalMoves[MaxLegalMoves];
+    for (int i = 0; i < MaxLegalMoves; ++i) legalMoves[i].move = moveNone();
+    ExtMove* pms = &legalMoves[0];
+    const u64 num = 5000000;
+    Timer t = Timer::currentTime();
+    if (pos.inCheck()) {
+        for (u64 i = 0; i < num; ++i) {
+            pms = &legalMoves[0];
+            pms = generateMoves<Evasion>(pms, pos);
+        }
+    }
+    else {
+        for (u64 i = 0; i < num; ++i) {
+            pms = &legalMoves[0];
+            pms = generateMoves<CapturePlusPro>(pms, pos);
+            pms = generateMoves<NonCaptureMinusPro>(pms, pos);
+            pms = generateMoves<Drop>(pms, pos);
+//          pms = generateMoves<PseudoLegal>(pms, pos);
+//          pms = generateMoves<Legal>(pms, pos);
+        }
+    }
+    const int elapsed = t.elapsed();
+    std::cout << "elapsed = " << elapsed << " [msec]" << std::endl;
+    if (elapsed != 0)
+        std::cout << "times/s = " << num * 1000 / elapsed << " [times/sec]" << std::endl;
+    const ptrdiff_t count = pms - &legalMoves[0];
+    std::cout << "num of moves = " << count << std::endl;
+    for (int i = 0; i < count; ++i)
+        std::cout << legalMoves[i].move.toCSA() << ", ";
+    std::cout << std::endl;
+}
+#endif
+
+void Searcher::doUSICommandLoop(int argc, char* argv[]) {
+    bool evalTableIsRead = false;
+    Position pos(DefaultStartPositionSFEN, threads.main(), thisptr);
+
+    std::string cmd;
+    std::string token;
+
+    for (int i = 1; i < argc; ++i)
+        cmd += std::string(argv[i]) + " ";
+
+    do {
+        if (argc == 1 && !std::getline(std::cin, cmd))
+            cmd = "quit";
+
+        std::istringstream ssCmd(cmd);
+
+        ssCmd >> std::skipws >> token;
+
+        if (token == "quit" || token == "stop" || token == "ponderhit" || token == "gameover") {
+            if (token != "ponderhit" || signals.stopOnPonderHit) {
+                signals.stop = true;
+                threads.main()->startSearching(true);
+            }
+            else
+                limits.ponder = false;
+            if (token == "ponderhit" && limits.moveTime != 0)
+                limits.moveTime += timeManager.elapsed();
+        }
+        else if (token == "go"       ) go(pos, ssCmd);
+        else if (token == "position" ) setPosition(pos, ssCmd);
+        else if (token == "usinewgame"); // isready で準備は出来たので、対局開始時に特にする事はない。
+        else if (token == "usi"      ) SYNCCOUT << "id name " << std::string(options["Engine_Name"])
+                                                << "\nid author Hiraoka Takuya"
+                                                << "\n" << options
+                                                << "\nusiok" << SYNCENDL;
+        else if (token == "isready"  ) { // 対局開始前の準備。
+            tt.clear();
+            threads.main()->previousScore = ScoreInfinite;
+            if (!evalTableIsRead) {
+                // 一時オブジェクトを生成して Evaluator::init() を呼んだ直後にオブジェクトを破棄する。
+                // 評価関数の次元下げをしたデータを格納する分のメモリが無駄な為、
+                std::unique_ptr<Evaluator>(new Evaluator)->init(options["Eval_Dir"], true);
+                evalTableIsRead = true;
+            }
+            SYNCCOUT << "readyok" << SYNCENDL;
+        }
+        else if (token == "setoption") setOption(ssCmd);
+        else if (token == "write_eval") { // 対局で使う為の評価関数バイナリをファイルに書き出す。
+            if (!evalTableIsRead)
+                std::unique_ptr<Evaluator>(new Evaluator)->init(options["Eval_Dir"], true);
+            Evaluator::writeSynthesized(options["Eval_Dir"]);
+        }
+#if defined LEARN
+        else if (token == "l"        ) {
+            auto learner = std::unique_ptr<Learner>(new Learner);
+            learner->learn(pos, ssCmd);
+        }
+        else if (token == "make_teacher") {
+            if (!evalTableIsRead) {
+                std::unique_ptr<Evaluator>(new Evaluator)->init(options["Eval_Dir"], true);
+                evalTableIsRead = true;
+            }
+            make_teacher(ssCmd);
+        }
+        else if (token == "use_teacher") {
+            if (!evalTableIsRead) {
+                std::unique_ptr<Evaluator>(new Evaluator)->init(options["Eval_Dir"], true);
+                evalTableIsRead = true;
+            }
+            use_teacher(pos, ssCmd);
+        }
+        else if (token == "check_teacher") {
+            check_teacher(ssCmd);
+        }
+        else if (token == "print"    ) printEvalTable(SQ88, f_gold + SQ78, f_gold, false);
+#endif
+#if !defined MINIMUL
+        // 以下、デバッグ用
+        else if (token == "bench"    ) {
+            if (!evalTableIsRead) {
+                std::unique_ptr<Evaluator>(new Evaluator)->init(options["Eval_Dir"], true);
+                evalTableIsRead = true;
+            }
+            benchmark(pos);
+        }
+        else if (token == "key"      ) SYNCCOUT << pos.getKey() << SYNCENDL;
+        else if (token == "tosfen"   ) SYNCCOUT << pos.toSFEN() << SYNCENDL;
+        else if (token == "eval"     ) std::cout << evaluateUnUseDiff(pos) / FVScale << std::endl;
+        else if (token == "d"        ) pos.print();
+        else if (token == "s"        ) measureGenerateMoves(pos);
+        else if (token == "t"        ) std::cout << pos.mateMoveIn1Ply().toCSA() << std::endl;
+        else if (token == "b"        ) makeBook(pos, ssCmd);
+#endif
+        else                           SYNCCOUT << "unknown command: " << cmd << SYNCENDL;
+    } while (token != "quit" && argc == 1);
+
+    threads.main()->waitForSearchFinished();
 }

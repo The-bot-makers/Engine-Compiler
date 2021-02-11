@@ -1,2370 +1,2151 @@
-﻿#include "position.h"
-#include "misc.h"
-#include "tt.h"
-#include "thread.h"
-#include "mate/mate.h"
+/*
+  Apery, a USI shogi playing engine derived from Stockfish, a UCI chess playing engine.
+  Copyright (C) 2004-2008 Tord Romstad (Glaurung author)
+  Copyright (C) 2008-2015 Marco Costalba, Joona Kiiski, Tord Romstad
+  Copyright (C) 2015-2016 Marco Costalba, Joona Kiiski, Gary Linscott, Tord Romstad
+  Copyright (C) 2011-2016 Hiraoka Takuya
 
-#include <iostream>
-#include <sstream>
-#include <cstring> // std::memset()
+  Apery is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
 
-#if defined(EVAL_KPPT) || defined(EVAL_KPP_KKPT) || defined(EVAL_NNUE)
-#include "eval/evaluate_common.h"
-#endif
+  Apery is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
 
-using namespace std;
-using namespace Effect8;
+  You should have received a copy of the GNU General Public License
+  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
 
-std::string SFEN_HIRATE = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
+#include "position.hpp"
+#include "move.hpp"
+#include "mt64bit.hpp"
+#include "generateMoves.hpp"
+#include "tt.hpp"
+#include "search.hpp"
 
-// 局面のhash keyを求めるときに用いるZobrist key
-namespace Zobrist {
-	HASH_KEY zero;							// ゼロ(==0)
-	HASH_KEY side;							// 手番(==1)
-	HASH_KEY psq[SQ_NB_PLUS1][PIECE_NB];	// 駒pcが盤上sqに配置されているときのZobrist Key
-	HASH_KEY hand[COLOR_NB][PIECE_HAND_NB];	// c側の手駒prが一枚増えるごとにこれを加算するZobristKey
-	HASH_KEY depth[MAX_PLY];				// 深さも考慮に入れたHASH KEYを作りたいときに用いる(実験用)
-}
+Key Position::zobrist_[PieceTypeNum][SquareNum][ColorNum];
+Key Position::zobHand_[HandPieceNum][ColorNum];
+Key Position::zobExclusion_;
 
-// ----------------------------------
-//           CheckInfo
-// ----------------------------------
-
-// 王手情報の初期化
-template <bool doNullMove>
-void Position::set_check_info(StateInfo* si) const {
-
-	//: si->blockersForKing[WHITE] = slider_blockers(pieces(BLACK), square<KING>(WHITE),si->pinners[WHITE]);
-	//: si->blockersForKing[BLACK] = slider_blockers(pieces(WHITE), square<KING>(BLACK),si->pinners[BLACK]);
-
-	// ↓Stockfishのこの部分の実装、将棋においては良くないので、以下のように変える。
-	// ※　将棋においては駒の動きが上下対称ではないので手番を引数で渡す必要がある。
-
-	if (!doNullMove)
-	{
-		// null moveのときは前の局面でこの情報は設定されているので更新する必要がない。
-		si->blockersForKing[WHITE] = slider_blockers(BLACK, square<KING>(WHITE), si->pinners[WHITE]);
-		si->blockersForKing[BLACK] = slider_blockers(WHITE, square<KING>(BLACK), si->pinners[BLACK]);
-	}
-
-	Square ksq = square<KING>(~sideToMove);
-
-	// 駒種Xによって敵玉に王手となる升のbitboard
-
-	// 歩であれば、自玉に敵の歩を置いたときの利きにある場所に自分の歩があればそれは敵玉に対して王手になるので、
-	// そういう意味で(ksq,them)となっている。
-
-	Bitboard occ = pieces();
-	Color them = ~sideToMove;
-
-	// この指し手が二歩でないかは、この時点でテストしない。指し手生成で除外する。なるべくこの手のチェックは遅延させる。
-	si->checkSquares[PAWN]   = pawnEffect(them, ksq);
-	si->checkSquares[KNIGHT] = knightEffect(them, ksq);
-	si->checkSquares[SILVER] = silverEffect(them, ksq);
-	si->checkSquares[BISHOP] = bishopEffect(ksq, occ);
-	si->checkSquares[ROOK]   = rookEffect(ksq, occ);
-	si->checkSquares[GOLD]   = goldEffect(them, ksq);
-
-	// 香で王手になる升は利きを求め直さずに飛車で王手になる升を香のstep effectでマスクしたものを使う。
-	si->checkSquares[LANCE]  = si->checkSquares[ROOK] & lanceStepEffect(them,ksq);
-
-	// 王を移動させて直接王手になることはない。それは自殺手である。
-	si->checkSquares[KING]   = ZERO_BB;
-
-	// 成り駒。この初期化は馬鹿らしいようだが、gives_check()は指し手ごとに呼び出されるので、その処理を軽くしたいので
-	// ここでの初期化は許容できる。(このコードはdo_move()に対して1回呼び出されるだけなので)
-	si->checkSquares[PRO_PAWN]   = si->checkSquares[GOLD];
-	si->checkSquares[PRO_LANCE]  = si->checkSquares[GOLD];
-	si->checkSquares[PRO_KNIGHT] = si->checkSquares[GOLD];
-	si->checkSquares[PRO_SILVER] = si->checkSquares[GOLD];
-	si->checkSquares[HORSE]      = si->checkSquares[BISHOP] | kingEffect(ksq);
-	si->checkSquares[DRAGON]     = si->checkSquares[ROOK]   | kingEffect(ksq);
-}
-
-// ----------------------------------
-//       Zorbrist keyの初期化
-// ----------------------------------
-
-#if defined(CUCKOO)
-// Marcel van Kervinck's cuckoo algorithm for fast detection of "upcoming repetition"
-// situations. Description of the algorithm in the following paper:
-// https://marcelk.net/2013-04-06/paper/upcoming-rep-v2.pdf
-
-// Stockfishの2倍の配列を確保
-
-// First and second hash functions for indexing the cuckoo tables
-inline int H1(Key h) { return h & 0x3fff; }
-inline int H2(Key h) { return (h >> 16) & 0x3fff; }
-
-// Cuckoo tables with Zobrist hashes of valid reversible moves, and the moves themselves
-Key cuckoo[8192*2];
-Move cuckooMove[8192*2];
-
-//  →　cuckooアルゴリズムとやらで、千日手局面に到達する指し手の検出が高速化できるらしい。
-// (数手前の局面と現在の局面の差が、ある駒の移動(+捕獲)だけであることが高速に判定できれば、
-// 　早期枝刈りとしてdraw_valueを返すことができる。)
-#endif
-
-void Position::init() {
-	PRNG rng(20151225); // 開発開始日 == 電王トーナメント2015,最終日
-
-	// 手番としてbit0を用いる。それ以外はbit0を使わない。これをxorではなく加算して行ってもbit0は汚されない。
-	SET_HASH(Zobrist::side, 1, 0, 0, 0);
-	SET_HASH(Zobrist::zero, 0, 0, 0, 0);
-
-	// 64bit hash keyは256bit hash keyの下位64bitという解釈をすることで、256bitと64bitのときとでhash keyの下位64bitは合致するようにしておく。
-	// これは定跡DBなどで使うときにこの性質が欲しいからである。
-	// またpc==NO_PIECEのときは0であることを保証したいのでSET_HASHしない。
-	// psqは、C++の規約上、事前にゼロであることは保証される。
-	for (auto pc : Piece())
-		for (auto sq : SQ)
-			if (pc)
-				SET_HASH(Zobrist::psq[sq][pc], rng.rand<Key>() & ~1ULL, rng.rand<Key>(), rng.rand<Key>(), rng.rand<Key>());
-
-	// またpr==NO_PIECEのときは0であることを保証したいのでSET_HASHしない。
-	for (auto c : COLOR)
-		for (PieceType pr = NO_PIECE_TYPE; pr < PIECE_HAND_NB; ++pr)
-			if (pr)
-				SET_HASH(Zobrist::hand[c][pr], rng.rand<Key>() & ~1ULL, rng.rand<Key>(), rng.rand<Key>(), rng.rand<Key>());
-
-	for (int i = 0; i < MAX_PLY; ++i)
-		SET_HASH(Zobrist::depth[i], rng.rand<Key>() & ~1ULL, rng.rand<Key>(), rng.rand<Key>(), rng.rand<Key>());
-
-#if defined(CUCKOO)
-	// Prepare the cuckoo tables
-	std::memset(cuckoo, 0, sizeof(cuckoo));
-	std::memset(cuckooMove, 0, sizeof(cuckooMove));
-	int count = 0;
-	// 重複カウント用
-	int count2 = 0;
-	for (auto pc : Piece())
-	{
-		auto pt = type_of(pc);
-		if (!(pt == PAWN || pt == LANCE || pt == KNIGHT || pt == SILVER || pt == GOLD || pt == BISHOP || pt == ROOK || pt == KING
-			|| pt == PRO_PAWN || pt == PRO_LANCE || pt == PRO_KNIGHT || pt == PRO_SILVER || pt == HORSE || pt == DRAGON))
-			continue;
-
-		// 将棋だとチェスと異なり、from →　toに動かせるからと言ってto→fromに動かせるとは限らないので
-		// ここのコード、ずいぶん違ってくる。
-		for (auto s1 : SQ)
-			for (Square s2 : SQ)
-				if (effects_from(pc, s1, ZERO_BB) & s2)
-				{
-					Move move = (Move)(make_move(s1, s2) + (pc << 16));
-					// 手番のところ使わない。無視するために潰す。
-					Key key = (Zobrist::psq[s2][pc] - Zobrist::psq[s1][pc]) >> 1/* Zobrist::side*/;
-					int i = H1(key);
-					while (true)
-					{
-						std::swap(cuckoo[i], key);
-						std::swap(cuckooMove[i], move);
-						if (move == MOVE_NONE) // Arrived at empty slot?
-							break;
-
-						//i = (i == H1(key)) ? H2(key) : H1(key); // Push victim to alternative slot
-						// →　これ、テーブル小さいので衝突しつづける…(´ω｀)　H1になかったらH2でええで..
-
-						i = H2(key);
-						std::swap(cuckoo[i], key);
-						std::swap(cuckooMove[i], move);
-
-						if (move != MOVE_NONE)
-							count2++;
-
-						break;
-					}
-					count++;
-				}
-	}
-	//assert(count == 3668); // chessの場合
-
-	// cout << "count = " << count << " , count2 = " << count2 << endl;
-	// chessの2倍の配列時 : count = 16456 , count2 = 4499 
-	// chessの4倍の配列時 : count = 16456 , count2 = 1623
-	ASSERT_LV3(count == 16456);
-#endif
-}
-
-// depthに応じたZobrist Hashを得る。depthを含めてhash keyを求めたいときに用いる。
-HASH_KEY DepthHash(int depth) { return Zobrist::depth[depth]; }
-
-// ----------------------------------
-//  Position::set()とその逆変換sfen()
-// ----------------------------------
-
-// Pieceを綺麗に出力する(USI形式ではない) 先手の駒は大文字、後手の駒は小文字、成り駒は先頭に+がつく。盤面表示に使う。
-#if !defined (PRETTY_JP)
-std::string pretty(Piece pc) { return std::string(USI_PIECE).substr(pc * 2, 2); }
-#else
-// "□"(四角)は文字フォントによっては半分の幅しかない。"口"(くち)にする。
-std::string USI_PIECE_KANJI[] = {
-	" 口"," 歩"," 香"," 桂"," 銀"," 角"," 飛"," 金"," 玉"," と"," 杏"," 圭"," 全"," 馬"," 龍"," 菌"," 王",
-		  "^歩","^香","^桂","^銀","^角","^飛","^金","^玉","^と","^杏","^圭","^全","^馬","^龍","^菌","^王"
+const HuffmanCode HuffmanCodedPos::boardCodeTable[PieceNone] = {
+    {Binary<         0>::value, 1}, // Empty
+    {Binary<         1>::value, 4}, // BPawn
+    {Binary<        11>::value, 6}, // BLance
+    {Binary<       111>::value, 6}, // BKnight
+    {Binary<      1011>::value, 6}, // BSilver
+    {Binary<     11111>::value, 8}, // BBishop
+    {Binary<    111111>::value, 8}, // BRook
+    {Binary<      1111>::value, 6}, // BGold
+    {Binary<         0>::value, 0}, // BKing 玉の位置は別途、位置を符号化する。使用しないので numOfBit を 0 にしておく。
+    {Binary<      1001>::value, 4}, // BProPawn
+    {Binary<    100011>::value, 6}, // BProLance
+    {Binary<    100111>::value, 6}, // BProKnight
+    {Binary<    101011>::value, 6}, // BProSilver
+    {Binary<  10011111>::value, 8}, // BHorse
+    {Binary<  10111111>::value, 8}, // BDragona
+    {Binary<         0>::value, 0}, // 使用しないので numOfBit を 0 にしておく。
+    {Binary<         0>::value, 0}, // 使用しないので numOfBit を 0 にしておく。
+    {Binary<       101>::value, 4}, // WPawn
+    {Binary<     10011>::value, 6}, // WLance
+    {Binary<     10111>::value, 6}, // WKnight
+    {Binary<     11011>::value, 6}, // WSilver
+    {Binary<   1011111>::value, 8}, // WBishop
+    {Binary<   1111111>::value, 8}, // WRook
+    {Binary<    101111>::value, 6}, // WGold
+    {Binary<         0>::value, 0}, // WKing 玉の位置は別途、位置を符号化する。
+    {Binary<      1101>::value, 4}, // WProPawn
+    {Binary<    110011>::value, 6}, // WProLance
+    {Binary<    110111>::value, 6}, // WProKnight
+    {Binary<    111011>::value, 6}, // WProSilver
+    {Binary<  11011111>::value, 8}, // WHorse
+    {Binary<  11111111>::value, 8}, // WDragon
 };
-std::string pretty(Piece pc) {
-#if 1
-	return USI_PIECE_KANJI[pc];
-#else
-	// 色を変えたほうがわかりやすい。Linuxは簡単だが、MS-DOSは設定が面倒。
-	// Linux : https://qiita.com/dojineko/items/49aa30018bb721b0b4a9
-	// MS-DOS : https://one-person.hatenablog.jp/entry/2017/02/23/125809
 
-	std::string result;
-	if (pc != NO_PIECE)
-		result = (color_of(pc) == BLACK) ? "\\e[32;40;1m" : "\\e[33;40;1m";
-	result += USI_PIECE_KANJI[pc];
-	if (pc != NO_PIECE)
-		result += "\\e[m";
-
-	return result;
-#endif
-}
-#endif
-
-// sfen文字列で盤面を設定する
-void Position::set(std::string sfen , StateInfo* si , Thread* th)
-{
-	std::memset(this, 0, sizeof(Position));
-
-	// 局面をrootより遡るためには、ここまでの局面情報が必要で、それは引数のsiとして渡されているという解釈。
-	// ThreadPool::start_thinking()では、
-	// ここをいったんゼロクリアしたのちに、呼び出し側で、そのsiを復元することにより、局面を遡る。
-	std::memset(si, 0, sizeof(StateInfo));
-	st = si;
-
-	// 変な入力をされることはあまり想定していない。
-	// sfen文字列は、普通GUI側から渡ってくるのでおかしい入力であることはありえないからである。
-
-	// --- 盤面
-
-	// 盤面左上から。Square型のレイアウトに依らずに処理を進めたいため、Square型は使わない。
-	File f = FILE_9;
-	Rank r = RANK_1;
-
-	std::istringstream ss(sfen);
-	// 盤面を読むときにスペースが盤面と手番とのセパレーターなのでそこを読み飛ばさないようにnoskipwsを指定しておく。
-	ss >> std::noskipws;
-
-	uint8_t token;
-	bool promote = false;
-	size_t idx;
-
-#if defined (USE_EVAL_LIST)
-	// evalListのclear。上でmemsetでゼロクリアしたときにクリアされているが…。
-	evalList.clear();
-
-	// PieceListを更新する上で、どの駒がどこにあるかを設定しなければならないが、
-	// それぞれの駒をどこまで使ったかのカウンター
-	PieceNumber piece_no_count[KING] = { PIECE_NUMBER_ZERO,PIECE_NUMBER_PAWN,PIECE_NUMBER_LANCE,PIECE_NUMBER_KNIGHT,
-	  PIECE_NUMBER_SILVER, PIECE_NUMBER_BISHOP, PIECE_NUMBER_ROOK,PIECE_NUMBER_GOLD };
-
-	// 先手玉のいない詰将棋とか、駒落ちに対応させるために、存在しない駒はすべてBONA_PIECE_ZEROにいることにする。
-	// 上のevalList.clear()で、ゼロクリアしているので、それは達成しているはず。
-#endif
-
-	kingSquare[BLACK] = kingSquare[WHITE] = SQ_NB;
-
-	while ((ss >> token) && !isspace(token))
-	{
-		// 数字は、空の升の数なのでその分だけ筋(File)を進める
-		if (isdigit(token))
-			f -= File(token - '0');
-		// '/'は次の段を意味する                              
-		else if (token == '/')
-		{
-			f = FILE_9;
-			++r;
-		}
-		// '+'は次の駒が成駒であることを意味する
-		else if (token == '+')
-			promote = true;
-		// 駒文字列か？
-		else if ((idx = PieceToCharBW.find(token)) != string::npos)
-		{
-			// 盤面の(f,r)の駒を設定する
-			auto sq = f | r;
-			auto pc = Piece(idx + (promote ? u32(PIECE_PROMOTE) : 0));
-			put_piece(sq, pc);
-
-#if defined (USE_EVAL_LIST)
-			PieceNumber piece_no =
-				(idx == B_KING) ? PIECE_NUMBER_BKING : // 先手玉
-				(idx == W_KING) ? PIECE_NUMBER_WKING : // 後手玉
-				piece_no_count[raw_type_of(Piece(idx))]++; // それ以外
-			evalList.put_piece(piece_no, sq, pc); // sqの升にpcの駒を配置する
-#endif
-
-			// 1升進める
-			--f;
-
-			// 成りフラグ、戻しておく。
-			promote = false;
-		}
-
-	}
-
-	// put_piece()を使ったので更新しておく。
-	// set_state()で駒種別のbitboardを参照するのでそれまでにこの関数を呼び出す必要がある。
-	update_bitboards();
-
-	// kingSquare[]の更新
-	update_kingSquare();
-
-	// --- 手番
-
-	ss >> token;
-	sideToMove = (token == 'w' ? WHITE : BLACK);
-	ss >> token; // 手番と手駒とを分かつスペース
-
-	// --- 手駒
-
-	hand[BLACK] = hand[WHITE] = (Hand)0;
-	int ct = 0;
-	while ((ss >> token) && !isspace(token))
-	{
-		// 手駒なし
-		if (token == '-')
-			break;
-
-		if (isdigit(token))
-			// 駒の枚数。歩だと18枚とかあるので前の値を10倍して足していく。
-			ct = (token - '0') + ct * 10;
-		else if ((idx = PieceToCharBW.find(token)) != string::npos)
-		{
-			// 個数が省略されていれば1という扱いをする。
-			ct = max(ct, 1);
-			add_hand(hand[color_of(Piece(idx))], type_of(Piece(idx)), ct);
-
-			// FV38などではこの個数分だけpieceListに突っ込まないといけない。
-			for (int i = 0; i < ct; ++i)
-			{
-				PieceType rpc = raw_type_of(Piece(idx));
-
-#if defined (USE_EVAL_LIST)
-				PieceNumber piece_no = piece_no_count[rpc]++;
-				ASSERT_LV1(is_ok(piece_no));
-				evalList.put_piece(piece_no, color_of(Piece(idx)), rpc, i);
-#endif
-			}
-			ct = 0;
-		}
-	}
-
-	// --- 手数(平手の初期局面からの手数)
-
-	// gamePlyとして将棋所では(検討モードなどにおいて)ここで常に1が渡されている。
-	// 検討モードにおいても棋譜上の手数を渡して欲しい気がするし、棋譜上の手数がないなら0を渡して欲しい気はする。
-	// ここで渡されてきた局面をもとに探索してその指し手を定跡DBに登録しようとするときに、ここの手数が不正確であるのは困る。
-	gamePly = 0;
-	ss >> std::skipws >> gamePly;
-
-	// --- StateInfoの更新
-
-	set_state(st);
-
-	// 現局面で王手がかかっているならst->continuous_check[them] = 1にしないと
-	// 連続王手の千日手の判定が不正確な気がするが、どのみち2回目の出現を負け扱いしているのでまあいいか..
-
-	// --- effect
-
-#if defined (LONG_EFFECT_LIBRARY)
-  // 利きの全計算による更新
-	LongEffect::calc_effect(*this);
-#endif
-
-	// --- evaluate
-
-#if defined (USE_PIECE_VALUE)
-	st->materialValue = Eval::material(*this);
-#endif
-
-	Eval::compute_eval(*this);
-
-	// --- validation
-
-#if ASSERT_LV >= 3
-  // これassertにしてしまうと、先手玉のいない局面や駒落ちの局面で落ちて困る。
-	if (!is_ok(*this))
-		std::cout << "info string Illigal Position?" << endl;
-#endif
-
-	thisThread = th;
-}
-
-// 局面のsfen文字列を取得する。
-// Position::set()の逆変換。
-const std::string Position::sfen(int gamePly_) const
-{
-	std::ostringstream ss;
-
-	// --- 盤面
-	int emptyCnt;
-	for (Rank r = RANK_1; r <= RANK_9; ++r)
-	{
-		for (File f = FILE_9; f >= FILE_1; --f)
-		{
-			// それぞれの升に対して駒がないなら
-			// その段の、そのあとの駒のない升をカウントする
-			for (emptyCnt = 0; f >= FILE_1 && piece_on(f | r) == NO_PIECE; --f)
-				++emptyCnt;
-
-			// 駒のなかった升の数を出力
-			if (emptyCnt)
-				ss << emptyCnt;
-
-			// 駒があったなら、それに対応する駒文字列を出力
-			if (f >= FILE_1)
-				ss << (piece_on(f | r));
-		}
-
-		// 最下段以外では次の行があるのでセパレーターである'/'を出力する。
-		if (r < RANK_9)
-			ss << '/';
-	}
-
-	// --- 手番
-	ss << (sideToMove == WHITE ? " w " : " b ");
-
-	// --- 手駒(UCIプロトコルにはないがUSIプロトコルにはある)
-	int n;
-	bool found = false;
-	for (Color c = BLACK; c <= WHITE; ++c)
-		for (int pn = 0 ; pn < 7; ++ pn)
-		{
-			// 手駒の出力順はUSIプロトコルでは規定されていないが、
-			// USI原案によると、飛、角、金、銀、桂、香、歩の順である。
-			// sfen文字列を一意にしておかないと定跡データーをsfen文字列で書き出したときに
-			// 他のソフトで文字列が一致しなくて困るので、この順に倣うことにする。
-
-			const PieceType USI_Hand[7] = { ROOK,BISHOP,GOLD,SILVER,KNIGHT,LANCE,PAWN };
-			auto p = USI_Hand[pn];
-
-			// その種類の手駒の枚数
-			n = hand_count(hand[c], p);
-			// その種類の手駒を持っているか
-			if (n != 0)
-			{
-				// 手駒が1枚でも見つかった
-				found = true;
-
-				// その種類の駒の枚数。1ならば出力を省略
-				if (n != 1)
-					ss << n;
-
-				ss << PieceToCharBW[make_piece(c, p)];
-			}
-		}
-
-	// 手駒がない場合はハイフンを出力
-	ss << (found ? " " : "- ");
-
-	// --- 初期局面からの手数
-	ss << gamePly_;
-
-	return ss.str();
-}
-
-void Position::set_state(StateInfo* si) const {
-
-	// --- bitboard
-
-	// この局面で自玉に王手している敵駒
-	st->checkersBB = attackers_to(~sideToMove, king_square(sideToMove));
-
-	// 王手情報の初期化
-	set_check_info<false>(si);
-
-	// --- hash keyの計算
-	si->board_key_ = sideToMove == BLACK ? Zobrist::zero : Zobrist::side;
-	si->hand_key_ = Zobrist::zero;
-	for (auto sq : pieces())
-	{
-		auto pc = piece_on(sq);
-		si->board_key_ += Zobrist::psq[sq][pc];
-	}
-	for (auto c : COLOR)
-		for (PieceType pr = PAWN; pr < PIECE_HAND_NB; ++pr)
-			si->hand_key_ += Zobrist::hand[c][pr] * (int64_t)hand_count(hand[c], pr); // 手駒はaddにする(差分計算が楽になるため)
-
-	// --- hand
-	si->hand = hand[sideToMove];
-
-}
-
-// put_piece(),remove_piece(),xor_piece()を用いたあとに呼び出す必要がある。
-void Position::update_bitboards()
-{
-	// 王・馬・龍を合成したbitboard
-	byTypeBB[HDK]			= pieces(KING , HORSE , DRAGON);
-
-	// 金と同じ移動特性を持つ駒
-	byTypeBB[GOLDS]			= pieces(GOLD , PRO_PAWN , PRO_LANCE , PRO_KNIGHT , PRO_SILVER);
-
-	// 以下、attackers_to()で頻繁に用いるのでここで1回計算しておいても、トータルでは高速化する。
-
-	// 角と馬
-	byTypeBB[BISHOP_HORSE]	= pieces(BISHOP , HORSE);
-
-	// 飛車と龍
-	byTypeBB[ROOK_DRAGON]	= pieces(ROOK   , DRAGON);
-
-	// 銀とHDK
-	byTypeBB[SILVER_HDK]	= pieces(SILVER , HDK);
-
-	// 金相当の駒とHDK
-	byTypeBB[GOLDS_HDK]		= pieces(GOLDS  , HDK);
-}
-
-// このクラスが保持しているkingSquare[]の更新。
-void Position::update_kingSquare()
-{
-	for (auto c : COLOR)
-	{
-		// 玉がいなければSQ_NBを設定しておいてやる。(片玉対応)
-		auto b = pieces(c, KING);
-		kingSquare[c] = b ? b.pop() : SQ_NB;
-	}
-}
-
-// ----------------------------------
-//           Positionの表示
-// ----------------------------------
-
-// 盤面を出力する。(USI形式ではない) デバッグ用。
-std::ostream& operator<<(std::ostream& os, const Position& pos)
-{
-	// 盤面
-	for (Rank r = RANK_1; r <= RANK_9; ++r)
-	{
-		for (File f = FILE_9; f >= FILE_1; --f)
-			os << pretty(pos.board[f | r]);
-		os << endl;
-	}
-
-#if !defined (PRETTY_JP)
-	// 手駒
-	os << "BLACK HAND : " << pos.hand[BLACK] << " , WHITE HAND : " << pos.hand[WHITE] << endl;
-
-	// 手番
-	os << "Turn = " << pos.sideToMove << endl;
-#else
-	os << "先手 手駒 : " << pos.hand[BLACK] << " , 後手 手駒 : " << pos.hand[WHITE] << endl;
-	os << "手番 = " << pos.sideToMove << endl;
-#endif
-
-	// sfen文字列もおまけで表示させておく。(デバッグのときに便利)
-	os << "sfen " << pos.sfen() << endl;
-
-	return os;
-}
-
-#if defined (KEEP_LAST_MOVE)
-#include <stack>
-
-// 開始局面からこの局面にいたるまでの指し手を表示する。
-std::string Position::moves_from_start(bool is_pretty) const
-{
-	StateInfo* p = st;
-	std::stack<StateInfo*> states;
-	while (p->previous != nullptr)
-	{
-		states.push(p);
-		p = p->previous;
-	}
-
-	stringstream ss;
-	while (states.size())
-	{
-		auto& top = states.top();
-		if (is_pretty)
-			ss << pretty(top->lastMove, top->lastMovedPieceType) << ' ';
-		else
-			ss << top->lastMove << ' ';
-		states.pop();
-	}
-	return ss.str();
-}
-#endif
-
-
-// ----------------------------------
-//      ある升へ利いている駒など
-// ----------------------------------
-
-// Position::slider_blockers() は、c側の長い利きを持つ駒(sliders)から、升sへの利きを
-// 遮っている先後の駒の位置をBitboardで返す。ただし、２重に遮っている場合はそれらの駒は返さない。
-// もし、この関数のこの返す駒を取り除いた場合、升sに対してsliderによって利きがある状態になる。
-// 升sにある玉に対してこの関数を呼び出した場合、それはpinされている駒と両王手の候補となる駒である。
-// また、升sにある玉は~c側のKINGであるとする。
-
-Bitboard Position::slider_blockers(Color c, Square s , Bitboard& pinners) const {
-
-	Bitboard blockers = ZERO_BB;
-
-	// pinnersは返し値。
-	pinners = ZERO_BB;
-
-	// cが与えられていないと香の利きの方向を確定させることが出来ない。
-	// ゆえに将棋では、この関数は手番を引数に取るべき。(チェスとはこの点において異なる。)
-
-	// snipersとは、pinされている駒が取り除かれたときに升sに利きが発生する大駒である。
-	Bitboard snipers =
-		( (pieces(ROOK_DRAGON)  & rookStepEffect(s))
-		| (pieces(BISHOP_HORSE) & bishopStepEffect(s))
-		// 香に関しては攻撃駒が先手なら、玉より下側をサーチして、そこにある先手の香を探す。
-		| (pieces(LANCE) & lanceStepEffect(~c, s))
-		) & pieces(c);
-
-	//Bitboard occupancy = pieces() ^ snipers;
-
-	// ↑このStockfishの元のコード、snipersを除いた盤上の駒で考えているが、
-	// ^王 歩 角 飛
-	// このような状況で飛車に対して角を取り除いてから敵玉への射線を考えるので、
-	// 歩がslider_blocker扱いになってしまう。つまり、このコードは間違っているのでは？
-	
-	while (snipers)
-	{
-		Square sniperSq = snipers.pop();
-		Bitboard b = between_bb(s, sniperSq) & pieces() /* occupancy */;
-
-		// snipperと玉との間にある駒が1個であるなら。
-		if (b && !more_than_one(b))
-		{
-			blockers |= b;
-			if (b & pieces(~c))
-				// sniperと玉に挟まれた駒が玉と同じ色の駒であるなら、pinnerに追加。
-				pinners |= sniperSq;
-		}
-	}
-	return blockers;
-}
-
-
-// sに利きのあるc側の駒を列挙する。
-// (occが指定されていなければ現在の盤面において。occが指定されていればそれをoccupied bitboardとして)
-Bitboard Position::attackers_to(Color c, Square sq, const Bitboard& occ) const
-{
-	ASSERT_LV3(is_ok(c) && sq <= SQ_NB);
-
-	Color them = ~c;
-
-	// sの地点に敵駒ptをおいて、その利きに自駒のptがあればsに利いているということだ。
-	// 香の利きを求めるコストが惜しいのでrookEffect()を利用する。
-	return
-		(     (pawnEffect(them, sq)		&  pieces(PAWN)        )
-			| (knightEffect(them, sq)	&  pieces(KNIGHT)      )
-			| (silverEffect(them, sq)	&  pieces(SILVER_HDK)  )
-			| (goldEffect(them, sq)		&  pieces(GOLDS_HDK)   )
-			| (bishopEffect(sq, occ)	&  pieces(BISHOP_HORSE))
-			| (rookEffect(sq, occ)		& (
-					pieces(ROOK_DRAGON)
-				|  (lanceStepEffect(them,sq) & pieces(LANCE))
-			  ))
-		//  | (kingEffect(sq) & pieces(c, HDK));
-		// →　HDKは、銀と金のところに含めることによって、参照するテーブルを一個減らして高速化しようというAperyのアイデア。
-			) & pieces(c); // 先後混在しているのでc側の駒だけ最後にマスクする。
-		;
-
-}
-
-// sに利きのあるc側の駒を列挙する。先後両方。
-// (occが指定されていなければ現在の盤面において。occが指定されていればそれをoccupied bitboardとして)
-// sq == SQ_NBでの呼び出しは合法。ZERO_BBが返る。
-Bitboard Position::attackers_to(Square sq, const Bitboard& occ) const
-{
-	ASSERT_LV3(sq <= SQ_NB);
-
-	// sqの地点に敵駒ptをおいて、その利きに自駒のptがあればsqに利いているということだ。
-	return
-		// 先手の歩・桂・銀・金・HDK
-		((    (pawnEffect(WHITE, sq)   & pieces(PAWN)        )
-			| (knightEffect(WHITE, sq) & pieces(KNIGHT)      )
-			| (silverEffect(WHITE, sq) & pieces(SILVER_HDK)  )
-			| (goldEffect(WHITE, sq)   & pieces(GOLDS_HDK)   )
-			) & pieces(BLACK))
-		|
-
-		// 後手の歩・桂・銀・金・HDK
-		((    (pawnEffect(BLACK, sq)   & pieces(PAWN)        )
-			| (knightEffect(BLACK, sq) & pieces(KNIGHT)      )
-			| (silverEffect(BLACK, sq) & pieces(SILVER_HDK)  )
-			| (goldEffect(BLACK, sq)   & pieces(GOLDS_HDK)   )
-			) & pieces(WHITE))
-
-		// 先後の角・飛・香
-		| (bishopEffect(sq, occ) & pieces(BISHOP_HORSE) )
-		| (rookEffect(sq, occ) & (
-			   pieces(ROOK_DRAGON)
-			| (pieces(BLACK , LANCE) & lanceStepEffect(WHITE , sq))
-			| (pieces(WHITE , LANCE) & lanceStepEffect(BLACK , sq))
-			// 香も、StepEffectでマスクしたあと飛車の利きを使ったほうが香の利きを求めなくて済んで速い。
-			));
-}
-
-// 打ち歩詰め判定に使う。王に打ち歩された歩の升をpawn_sqとして、c側(王側)のpawn_sqへ利いている駒を列挙する。香が利いていないことは自明。
-inline Bitboard Position::attackers_to_pawn(Color c, Square pawn_sq) const
-{
-	ASSERT_LV3(is_ok(c) && pawn_sq <= SQ_NB);
-
-	Color them = ~c;
-	const Bitboard& occ = pieces();
-
-	// 馬と龍
-	const Bitboard bb_hd = kingEffect(pawn_sq) & pieces(HORSE,DRAGON);
-	// 馬、龍の利きは考慮しないといけない。しかしここに玉が含まれるので玉は取り除く必要がある。
-	// bb_hdは銀と金のところに加えてしまうことでテーブル参照を一回減らす。
-
-	// sの地点に敵駒ptをおいて、その利きに自駒のptがあればsに利いているということだ。
-	// 打ち歩詰め判定なので、その打たれた歩を歩、香、王で取れることはない。(王で取れないことは事前にチェック済)
-	return
-		(     (knightEffect(them, pawn_sq) &  pieces(KNIGHT)          )
-			| (silverEffect(them, pawn_sq) & (pieces(SILVER) | bb_hd) )
-			| (goldEffect(them, pawn_sq)   & (pieces(GOLDS)  | bb_hd) )
-			| (bishopEffect(pawn_sq, occ)  &  pieces(BISHOP_HORSE)    )
-			| (rookEffect(pawn_sq, occ)    &  pieces(ROOK_DRAGON)     )
-			) & pieces(c);
-}
-
-
-// 指し手が、(敵玉に)王手になるかをテストする。
-
-bool Position::gives_check(Move m) const
-{
-	// 指し手がおかしくないか
-	ASSERT_LV3(is_ok(m));
-
-	// 移動先
-	const Square to = to_sq(m);
-
-	// 駒打ち・移動する指し手どちらであってもmove_piece_after(m)で移動後の駒が取得できるので
-	// 直接王手の処理は共通化できる。
-	if (st->checkSquares[type_of(moved_piece_after(m))] & to)
-		return true;
-
-	// -- 移動する指し手ならば、これで開き王手になるかどうかの判定が必要。
-
-	// 移動元
-	const Square from = from_sq(m);
-
-	// 開き王手になる駒の候補があるとして、fromにあるのがその駒で、fromからtoは玉と直線上にないなら
-	// 前提条件より、fromにあるのが自駒であることは確定しているので、pieces(sideToMove)は不要。
-	return !is_drop(m)
-		&& (((blockers_for_king(~sideToMove) /*& pieces(sideToMove)*/) & from)
-		&& !aligned(from, to, square<KING>(~sideToMove)));
-}
-
-Bitboard Position::pinned_pieces(Color c, Square avoid) const {
-	Bitboard b, pinners, result = ZERO_BB;
-	Square ksq = king_square(c);
-
-	// avoidを除外して考える。
-	Bitboard avoid_bb = ~Bitboard(avoid);
-
-	pinners = (
-		  (pieces(ROOK_DRAGON)   & rookStepEffect(ksq))
-		| (pieces(BISHOP_HORSE)  & bishopStepEffect(ksq))
-		| (pieces(LANCE)         & lanceStepEffect(c, ksq))
-		) & avoid_bb & pieces(~c);
-
-	while (pinners)
-	{
-		b = between_bb(ksq, pinners.pop()) & pieces() & avoid_bb;
-		if (!more_than_one(b))
-			result |= b & pieces(c);
-	}
-	return result;
-}
-
-Bitboard Position::pinned_pieces(Color c, Square from, Square to) const {
-	Bitboard b, pinners, result = ZERO_BB;
-	Square ksq = king_square(c);
-
-	// avoidを除外して考える。
-	Bitboard avoid_bb = ~Bitboard(from);
-
-	pinners = (
-		(pieces(ROOK_DRAGON)    & rookStepEffect(ksq))
-		| (pieces(BISHOP_HORSE) & bishopStepEffect(ksq))
-		| (pieces(LANCE)        & lanceStepEffect(c, ksq))
-		) & avoid_bb & pieces(~c);
-
-	// fromからは消えて、toの地点に駒が現れているものとして
-	Bitboard new_pieces = (pieces() & avoid_bb) | to;
-	while (pinners)
-	{
-		b = between_bb(ksq, pinners.pop()) & new_pieces;
-		if (!more_than_one(b))
-			result |= b & pieces(c);
-	}
-	return result;
-}
-
-// 現局面で指し手がないかをテストする。指し手生成ルーチンを用いるので速くない。探索中には使わないこと。
-bool Position::is_mated() const
-{
-	// 不成で詰めろを回避できるパターンはないのでLEGAL_ALLである必要はない。
-	return MoveList<LEGAL>(*this).size() == 0;
-}
-
-// ----------------------------------
-//      指し手の合法性のテスト
-// ----------------------------------
-
-bool Position::legal_drop(const Square to) const
-{
-	const auto us = sideToMove;
-
-	// 打とうとする歩の利きに相手玉がいることは前提条件としてクリアしているはず。
-	ASSERT_LV3(pawnEffect(us, to) == Bitboard(king_square(~us)));
-
-	// この歩に利いている自駒(歩を打つほうの駒)がなければ詰みには程遠いのでtrue
-	if (!effected_to(us, to))
-		return true;
-
-	// ここに利いている敵の駒があり、その駒で取れるなら打ち歩詰めではない
-	// ここでは玉は除外されるし、香が利いていることもないし、そういう意味では、特化した関数が必要。
-	Bitboard b = attackers_to_pawn(~us, to);
-
-	// 敵玉に対するpinしている駒(自駒も含むが、bが敵駒なので問題ない。)
-	Bitboard pinned = blockers_for_king(~us);
-
-	// pinされていない駒が1つでもあるなら、相手はその駒で取って何事もない。
-	if (b & (~pinned | FILE_BB[file_of(to)]))
-		return true;
-
-	// 攻撃駒はすべてpinされていたということであり、
-	// 王の頭に打たれた打ち歩をpinされている駒で取れるケースは、
-	// いろいろあるが、例1),例2)のような場合であるから、例3)のケースを除き、
-	// いずれも玉の頭方向以外のところからの玉頭方向への移動であるから、
-	// pinされている方向への移動ということはありえない。
-	// 例3)のケースを除くと、この歩は取れないことが確定する。
-	// 例3)のケースを除外するために同じ筋のものはpinされていないものとして扱う。
-	//    上のコードの　 " | FILE_BB[file_of(to)] " の部分がそれ。
-
-	// 例1)
-	// ^玉 ^角  飛
-	//  歩
-
-	// 例2)
-	// ^玉
-	//  歩 ^飛
-	//          角
-
-	// 例3)
-	// ^玉
-	//  歩
-	// ^飛
-	//  香
-
-	// 玉の退路を探す
-	// 自駒がなくて、かつ、to(はすでに調べたので)以外の地点
-
-	// 相手玉の場所
-	Square sq_king = king_square(~us);
-
-#ifndef LONG_EFFECT_LIBRARY
-	// LONG EFFECT LIBRARYがない場合、愚直に8方向のうち逃げられそうな場所を探すしかない。
-
-	Bitboard escape_bb = kingEffect(sq_king) & ~pieces(~us);
-	escape_bb ^= to;
-	auto occ = pieces() ^ to; // toには歩をおく前提なので、ここには駒があるものとして、これでの利きの遮断は考えないといけない。
-	while (escape_bb)
-	{
-		Square king_to = escape_bb.pop();
-		if (!attackers_to(us, king_to, occ))
-			return true; // 退路が見つかったので打ち歩詰めではない。
-	}
-
-	// すべての検査を抜けてきたのでこれは打ち歩詰めの条件を満たしている。
-	return false;
-#else
-	// LONG EFFECT LIBRARYがあれば、玉の8近傍の利きなどを直列化して逃げ場所があるか調べるだけで良いはず。
-
-	auto a8_effet_us = board_effect[us].around8(sq_king);
-	// 玉の逃げ場所は、本来はEffect8::around8(escape_bb,sq_king)なのだが、どうせaround8が8近傍だけを直列化するので、
-	// これが玉の利きと一致しているからこのkingEffect(sq_king)でマスクする必要がない。
-	auto a8_them_movable = Effect8::around8(~pieces(~us), sq_king) & Effect8::board_mask(sq_king);
-
-	// 打った歩での遮断を考える前の段階ですでにすでに歩を打つ側の利きがない升があり、
-	// そこに移動できるのであれば、これは打ち歩ではない。
-	if (~a8_effet_us & a8_them_movable)
-		return true;
-
-	// 困ったことに行けそうな升がなかったので打った歩による利きの遮断を考える。
-	// いまから打つ歩による遮断される升の利きが2以上でなければそこに逃げられるはず。
-	auto a8_long_effect_to = long_effect.directions_of(us, to);
-	auto to_dir = (us == BLACK) ? DIRECT_D : DIRECT_U;  // 王から見た歩の方角
-	auto a8_cutoff_dir = Effect8::cutoff_directions(to_dir, a8_long_effect_to);
-	auto a8_target = a8_cutoff_dir & a8_them_movable & ~board_effect[us].around8_greater_than_one(sq_king);
-
-	return a8_target != 0;
-#endif
-}
-
-// ※　mがこの局面においてpseudo_legalかどうかを判定するための関数。
-template <bool All>
-bool Position::pseudo_legal_s(const Move m) const {
-
-	const Color us = sideToMove;
-	const Square to = to_sq(m); // 移動先
-
-	if (is_drop(m))
-	{
-		const PieceType pr = move_dropped_piece(m);
-		// 置換表から取り出してきている以上、一度は指し手生成ルーチンで生成した指し手のはずであり、
-		// KING打ちのような値であることはないものとする。
-
-		// 上位32bitに移動後の駒が格納されている。それと一致するかのテスト
-		if (moved_piece_after(m) != Piece(pr + (us == WHITE ? u32(PIECE_WHITE) : 0) ))
-			return false;
-
-		ASSERT_LV3(PAWN <= pr && pr < KING);
-
-		// 打つ先の升が埋まっていたり、その手駒を持っていなかったりしたら駄目。
-		if (piece_on(to) != NO_PIECE || hand_count(hand[us], pr) == 0)
-			return false;
-
-		if (in_check())
-		{
-			// 王手されている局面なので合駒でなければならない
-			Bitboard target = checkers();
-			Square checksq = target.pop();
-
-			// 王手している駒を1個取り除いて、もうひとつあるということは王手している駒が
-			// 2つあったということであり、両王手なので合い利かず。
-			if (target)
-				return false;
-
-			// 王と王手している駒との間の升に駒を打っていない場合、それは王手を回避していることに
-			// ならないので、これは非合法手。
-			if (!(between_bb(checksq, king_square(us)) & to))
-				return false;
-		}
-
-		// 歩のとき、二歩および打ち歩詰めであるなら非合法手
-		if (pr == PAWN && !legal_pawn_drop(us, to))
-			return false;
-
-		// --- 移動できない升への歩・香・桂打ちについて
-
-		// 打てない段に打つ歩・香・桂の指し手はそもそも生成されていない。
-		// 置換表のhash衝突で、後手の指し手が先手の指し手にならないことは保証されている。
-		// (先手の手番の局面と後手の手番の局面とのhash keyはbit0で区別しているので)
-
-		// しかし、Counter Moveの手は手番に関係ないので(駒種を保持していないなら)取り違える可能性があるため
-		// (しかも、その可能性はそこそこ高い)、ここで合法性をチェックする必要がある。
-		// →　指し手生成の段階で駒種を保存するようにしたのでこのテスト不要。
-
-	}
-	else {
-
-		const Square from = from_sq(m);
-		const Piece pc = piece_on(from);
-
-		// 動かす駒が自駒でなければならない
-		if (pc == NO_PIECE || color_of(pc) != us)
-			return false;
-
-		// toに移動できないといけない。
-		if (!(effects_from(pc, from, pieces()) & to))
-			return false;
-
-		// toの地点に自駒があるといけない
-		if (pieces(us) & to)
-			return false;
-
-		PieceType pt = type_of(pc);
-		if (is_promote(m))
-		{
-			// --- 成る指し手
-
-			// 成れない駒の成りではないことを確かめないといけない。
-			static_assert(GOLD == 7, "GOLD must be 7.");
-			if (pt >= GOLD)
-				return false;
-
-			// 上位32bitに移動後の駒が格納されている。それと一致するかのテスト
-			// pcが成っていない駒であることは上で確認してあるので、"+ PIECE_PROMOTE"でも十分。
-			if (moved_piece_after(m) != Piece(pc + PIECE_PROMOTE))
-				return false;
-		}
-		else {
-
-			// --- 成らない指し手
-
-			// 上位32bitに移動後の駒が格納されている。それと一致するかのテスト
-			if (moved_piece_after(m) != pc)
-				return false;
-
-			// 駒打ちのところに書いた理由により、不成で進めない升への指し手のチェックも不要。
-			// 間違い　→　駒種をmoveに含めていないならこのチェック必要だわ。
-			// 52から51銀のような指し手がkillerやcountermoveに登録されていたとして、52に歩があると
-			// 51歩不成という指し手を生成してしまう…。
-			// あと、歩や大駒が敵陣において成らない指し手も不要なのでは..。
-
-			if (All)
-			{
-				// 歩と香に関しては1段目への不成は不可。桂は、桂飛びが出来る駒は桂しかないので
-				// 移動元と移動先がこれであるかぎり、それは桂の指し手生成によって生成されたものだから
-				// これが非合法手であることはない。
-
-				if (pt == PAWN || pt == LANCE)
-					if ((us == BLACK && rank_of(to) == RANK_1) || (us == WHITE && rank_of(to) == RANK_9))
-						return false;
-			}
-			else {
-				// 歩の不成と香の2段目への不成を禁止。
-				// 大駒の不成を禁止
-				switch (pt)
-				{
-				case PAWN:
-					if (enemy_field(us) & to)
-						return false;
-					break;
-
-				case LANCE:
-					if ((us == BLACK && rank_of(to) <= RANK_2) || (us == WHITE && rank_of(to) >= RANK_8))
-						return false;
-					break;
-
-				case BISHOP:
-				case ROOK:
-					if (enemy_field(us) & (Bitboard(from) | Bitboard(to)))
-						return false;
-					break;
-
-				default:
-					break;
-				}
-			}
-
-		}
-
-		// 王手している駒があるのか
-		if (checkers())
-		{
-			// このとき、指し手生成のEVASIONで生成される指し手と同等以上の条件でなければならない。
-
-			// 動かす駒は王以外か？
-			if (type_of(pc) != KING)
-			{
-				// 両王手なら王の移動をさせなければならない。
-				if (more_than_one(checkers()))
-					return false;
-
-				// 指し手は、王手を遮断しているか、王手している駒の捕獲でなければならない。
-				// ※　王手している駒と王の間に王手している駒の升を足した升が駒の移動先であるか。
-				// 例) 王■■■^飛
-				// となっているときに■の升か、^飛 のところが移動先であれば王手は回避できている。
-				// (素抜きになる可能性はあるが、そのチェックはここでは不要)
-				if (!((between_bb(checkers().pop(), king_square(us)) | checkers()) & to))
-					return false;
-			}
-
-			// 玉の自殺手のチェックはlegal()のほうで調べているのでここではやらない。
-
-		}
-	}
-
-	return true;
-}
-
-// 生成した指し手(CAPTUREとかNON_CAPTUREとか)が、合法であるかどうかをテストする。
-bool Position::legal(Move m) const
-{
-	if (is_drop(m))
-		// 打ち歩詰めは指し手生成で除外されている。
-		return true;
-	else
-	{
-		Color us = sideToMove;
-		Square from = from_sq(m);
-
-		ASSERT_LV5(color_of(piece_on(from_sq(m))) == us);
-		ASSERT_LV5(piece_on(square<KING>(us)) == make_piece(us, KING));
-
-		// もし移動させる駒が玉であるなら、行き先の升に相手側の利きがないかをチェックする。
-		if (type_of(piece_on(from)) == KING)
-			return !effected_to(~us, to_sq(m), from);
-
-		// blockers_for_king()は、pinされている駒(自駒・敵駒)を表現するが、fromにある駒は自駒であることは
-		// わかっているのでこれで良い。
-		return   !(blockers_for_king(us) & from)
-			|| aligned(from, to_sq(m), square<KING>(us));
-	}
-}
-
-
-// 置換表から取り出したMoveを32bit化する。
-Move Position::to_move(Move16 m16) const
-{
-	//		ASSERT_LV3(is_ok(m));
-	// 置換表から取り出した値なので m==MOVE_NONE(0)である可能性があり、ASSERTは書けない。
-
-	// 上位16bitは0でなければならない
-	//      ASSERT_LV3((m >> 16) == 0);
-
-	Move m = (Move)m16.to_u16();
-
-	// MOVE_NULLの可能性はないはずだが、MOVE_WINである可能性はある。
-	// それはそのまま返す。(MOVE_WINの機会はごくわずかなのでこれのために
-	// このチェックが探索時に起きるのは少し馬鹿らしい気もする。
-	// どうせ探索時はlegalityのチェックに引っかかり無視されるわけで…)
-	if (!is_ok(m))
-		return m;
-
-	return
-		Move(u16(m) +
-			((is_drop(m) ? (Piece)(make_piece(sideToMove, move_dropped_piece(m)))
-			: is_promote(m) ? (Piece)(piece_on(from_sq(m)) | PIECE_PROMOTE) : piece_on(from_sq(m))) << 16)
-		// "+ PIECE_PROMOTE" だと、玉や成り駒に対して 8足しておかしくなってしまう。(置換表の指し手をpseudo-legalか
-		// 確認せずに置換表の値で枝刈りして、そのあとupdate_statsを行う時に配列境界を超えかねない)
-		// " | PIECE_PROMOTE"が正しいコード。 WCSC29で平岡さんから教えてもらった。[2019/05/04]
-		// また、move_dropped_piece()はおかしい値になっていないことは保証されている(置換表に自分で書き出した値のため)
-		// これにより、配列境界の外側に書き出してしまうことはない。
-
-		// m==MOVE_NONE(0)の場合、piece_on(SQ_ZERO)の駒が上位16bitに格納されると少し気持ち悪いが、
-		// 移動元と移動先が SQ_11なので実質的に無害。
-	);
-
-}
-
-
-// ----------------------------------
-//      局面を進める/戻す
-// ----------------------------------
-
-// 指し手で盤面を1手進める。
-template <Color Us>
-void Position::do_move_impl(Move m, StateInfo& new_st, bool givesCheck)
-{
-	// MOVE_NONEはもちろん、MOVE_NULL , MOVE_RESIGNなどお断り。
-	ASSERT_LV3(is_ok(m));
-
-	ASSERT_LV3(&new_st != st);
-
-	// 探索ノード数 ≒do_move()の呼び出し回数のインクリメント。
-	thisThread->nodes.fetch_add(1, std::memory_order_relaxed);
-
-	//std::cout << *this << m << std::endl;
-
-	// ----------------------
-	//  StateInfoの更新
-	// ----------------------
-
-	// hash key
-
-	// 現在の局面のhash keyはこれで、これを更新していき、次の局面のhash keyを求めてStateInfo::key_に格納。
-	Key64 k = st->board_key_ ^ Zobrist::side;
-	Key64 h = st->hand_key_;
-
-	// StateInfoの構造体のメンバーの上からkeyのところまでは前のを丸ごとコピーしておく。
-	// undo_moveで戻すときにこの部分はundo処理が要らないので細かい更新処理が必要なものはここに載せておけばundoが速くなる。
-
-	// std::memcpy(&new_st, st, offsetof(StateInfo, checkersBB));
-	// 将棋ではこの処理、要らないのでは…。
-
-	// StateInfoを遡れるようにpreviousを設定しておいてやる。
-	StateInfo* prev;
-	new_st.previous = prev = st;
-	st = &new_st;
-
-	// --- 手数がらみのカウンターのインクリメント
-
-	// 厳密には、これはrootからの手数ではなく、初期盤面からの手数ではあるが。
-	++gamePly;
-	
-	// st->previousで遡り可能な手数カウンタ
-	st->pliesFromNull = prev->pliesFromNull + 1;
-
-	// 評価値の差分計算用の初期化
-
-#if defined(EVAL_KPPT) || defined(EVAL_KPP_KKPT)
-	st->sum.p[0][0] = VALUE_NOT_EVALUATED;
-#endif
-#if defined(EVAL_NNUE)
-	st->accumulator.computed_accumulation = false;
-	st->accumulator.computed_score = false;
-#endif
-
-#if defined(USE_BOARD_EFFECT_PREV)
-	// NNUE-HalfKPE9
-	// 現局面のboard_effectをコピー
-	std::memcpy(board_effect_prev, board_effect, sizeof(board_effect));
-#endif
-
-	// 直前の指し手を保存するならばここで行なう。
-
-#if defined (KEEP_LAST_MOVE)
-	st->lastMove = m;
-	st->lastMovedPieceType = is_drop(m) ? (PieceType)from_sq(m) : type_of(piece_on(from_sq(m)));
-#endif
-
-	// ----------------------
-	//    盤面の更新処理
-	// ----------------------
-
-	// 移動先の升
-	Square to = to_sq(m);
-	ASSERT_LV2(is_ok(to));
-
-#if defined (USE_PIECE_VALUE)
-	// 駒割りの差分計算用
-	int materialDiff;
-#endif
-
-#if defined (USE_EVAL_LIST)
-	auto& dp = st->dirtyPiece;
-#endif
-
-	if (is_drop(m))
-	{
-		// --- 駒打ち
-
-		// 移動先の升は空のはず
-		ASSERT_LV2(piece_on(to) == NO_PIECE);
-
-		Piece pc = moved_piece_after(m);
-		PieceType pr = raw_type_of(pc);
-		ASSERT_LV2(PAWN <= pr && pr < PIECE_HAND_NB);
-
-		// Zobrist keyの更新
-		h -= Zobrist::hand[Us][pr];
-		k += Zobrist::psq[to][pc];
-
-		// なるべく早い段階でのTTに対するprefetch
-		// 駒打ちのときはこの時点でTT entryのアドレスが確定できる
-		const Key key = k + h;
-		prefetch(TT.first_entry(key));
-#if defined(USE_EVAL_HASH)
-		Eval::prefetch_evalhash(key);
-#endif
-
-		put_piece(to, pc);
-
-		// 打駒した駒に関するevalListの更新。
-#if defined (USE_EVAL_LIST)
-		PieceNumber piece_no = piece_no_of(Us, pr);
-		ASSERT_LV3(is_ok(piece_no));
-
-		// KPPの差分計算のために移動した駒をStateInfoに記録しておく。
-		dp.dirty_num = 1; // 動いた駒は1個
-		dp.pieceNo[0] = piece_no;
-		dp.changed_piece[0].old_piece = evalList.bona_piece(piece_no);
-		evalList.put_piece(piece_no , to, pc);
-		dp.changed_piece[0].new_piece = evalList.bona_piece(piece_no);
-#endif
-
-		// piece_no_of()のときにこの手駒の枚数を参照するのであとで更新。
-		sub_hand(hand[Us], pr);
-		
-		// 王手している駒のbitboardを更新する。
-		// 駒打ちなのでこの駒で王手になったに違いない。駒打ちで両王手はありえないので王手している駒はいまtoに置いた駒のみ。
-		if (givesCheck)
-		{
-			st->checkersBB = Bitboard(to);
-			st->continuousCheck[Us] = prev->continuousCheck[Us] + 2;
-
-			// Stockfishのコードは、ここのコード、" += 2 "になっているが、
-			// やねうら王ではStateInfoのmemcpy()をしないことにしたので
-			// 前ノードの値に対して、" + 2 "しないといけない。
-
-		} else {
-			st->checkersBB = ZERO_BB;
-			st->continuousCheck[Us] = 0;
-		}
-
-		// 駒打ちは捕獲した駒がない。
-		st->capturedPiece = NO_PIECE;
-
-		// put_piece()などを用いたのでupdateする
-		update_bitboards();
-
-#if defined(USE_PIECE_VALUE)
-		// 駒打ちなので駒割りの変動なし。
-		materialDiff = 0;
-#endif
-
-#if defined(LONG_EFFECT_LIBRARY)
-		// 駒打ちによる利きの更新処理
-		LongEffect::update_by_dropping_piece<Us>(*this, to, pc);
-#endif
-
-	} else {
-
-		// -- 駒の移動
-		Square from = from_sq(m);
-		ASSERT_LV2(is_ok(from));
-
-		// 移動させる駒
-		Piece moved_pc = piece_on(from);
-		ASSERT_LV2(moved_pc != NO_PIECE);
-
-		// 移動先に駒の配置
-		// もし成る指し手であるなら、成った後の駒を配置する。
-		Piece moved_after_pc = moved_piece_after(m);
-
-#if defined (USE_PIECE_VALUE)
-		materialDiff = is_promote(m) ? Eval::ProDiffPieceValue[moved_pc] : 0;
-#endif
-
-		// 移動先の升にある駒
-		Piece to_pc = piece_on(to);
-		if (to_pc != NO_PIECE)
-		{
-			// --- capture(駒の捕獲)
-
-#if defined(LONG_EFFECT_LIBRARY)
-	  // 移動先で駒を捕獲するときの利きの更新
-			LongEffect::update_by_capturing_piece<Us>(*this, from, to, moved_pc, moved_after_pc, to_pc);
-#endif
-
-			// 玉を取る指し手が実現することはない。この直前の局面で玉を逃げる指し手しか合法手ではないし、
-			// 玉を逃げる指し手がないのだとしたら、それは詰みの局面であるから。
-
-			ASSERT_LV1(type_of(to_pc) != KING);
-
-			PieceType pr = raw_type_of(to_pc);
-
-			// 捕獲した駒に関するevalListの更新
-#if defined (USE_EVAL_LIST)
-			// このPieceNumberの駒が手駒に移動したのでEvalListのほうを更新しておく。
-			PieceNumber piece_no = piece_no_of(to);
-			ASSERT_LV3(is_ok(piece_no));
-			dp.dirty_num = 2; // 動いた駒は2個
-			dp.pieceNo[1] = piece_no;
-			dp.changed_piece[1].old_piece = evalList.bona_piece(piece_no);
-			evalList.put_piece(piece_no, Us, pr, hand_count(hand[Us], pr));
-			dp.changed_piece[1].new_piece = evalList.bona_piece(piece_no);
-#endif
-
-			// 駒取りなら現在の手番側の駒が増える。
-			add_hand(hand[Us], pr);
-
-			// 捕獲される駒の除去
-			remove_piece(to);
-
-			// 捕獲された駒が盤上から消えるので局面のhash keyを更新する
-			k -= Zobrist::psq[to][to_pc];
-			h += Zobrist::hand[Us][pr];
-
-			// 捕獲した駒をStateInfoに保存しておく。(undo_moveのため)
-			st->capturedPiece = to_pc;
-
-#if defined (USE_PIECE_VALUE)
-			// 評価関数で使う駒割りの値も更新
-			materialDiff += Eval::CapturePieceValue[to_pc];
-#endif
-
-		} else {
-			// 駒を取らない指し手
-
-			st->capturedPiece = NO_PIECE;
-
-#if defined (LONG_EFFECT_LIBRARY)
-			// 移動先で駒を捕獲しないときの利きの更新
-			LongEffect::update_by_no_capturing_piece<Us>(*this, from, to, moved_pc, moved_after_pc);
-#endif
-#if defined (USE_EVAL_LIST)
-			dp.dirty_num = 1; // 動いた駒は1個
-#endif
-		}
-
-#if defined (USE_EVAL_LIST)
-		// 移動元にあった駒のpiece_noを得る
-		PieceNumber piece_no2 = piece_no_of(from);
-		dp.pieceNo[0] = piece_no2;
-		dp.changed_piece[0].old_piece = evalList.bona_piece(piece_no2);
-#endif
-
-		// 移動元の升からの駒の除去
-		remove_piece(from);
-		// 移動先の升に駒を配置
-		put_piece(to, moved_after_pc);
-
-#if defined (USE_EVAL_LIST)
-		evalList.put_piece(piece_no2, to, moved_after_pc);
-		dp.changed_piece[0].new_piece = evalList.bona_piece(piece_no2);
-#endif
-
-		// 王を移動させる手であるなら、kingSquareを更新しておく。
-		// これを更新しておかないとking_square()が使えなくなってしまう。
-		// 王は駒打できないのでdropの指し手に含まれていることはないから
-		// dropのときにはkingSquareを更新する必要はない。
-		if (type_of(moved_pc) == KING)
-			kingSquare[Us] = to;
-
-		// fromにあったmoved_pcがtoにmoved_after_pcとして移動した。
-		k -= Zobrist::psq[from][moved_pc];
-		k += Zobrist::psq[to][moved_after_pc];
-
-		// 駒打ちでないときはprefetchはこの時点まで延期される。
-		const Key key = k + h;
-		prefetch(TT.first_entry(key));
-#if defined(USE_EVAL_HASH)
-		Eval::prefetch_evalhash(key);
-#endif
-
-		// put_piece()などを用いたのでupdateする。
-		// ROOK_DRAGONなどをこの直後で用いるのでここより後ろにやるわけにはいかない。
-		update_bitboards();
-
-		// 王手している駒のbitboardを更新する。
-		if (givesCheck)
-		{
-			// 高速化のためにごにょごにょ。
-#if 1
-			const StateInfo* prevSt = st->previous;
-
-			// 1) 直接王手であるかどうかは、移動によって王手になる駒別のBitboardを調べればわかる。
-			st->checkersBB = prevSt->checkSquares[type_of(moved_after_pc)] & to;
-
-			// 2) 開き王手になるのか
-			const Square ksq = king_square(~Us);
-			// pos->discovered_check_candidates()で取得したいが、もうstを更新してしまっているので出来ないので
-			// prevSt->blockersForKing[~Us] & pieces(Us)と愚直に書く。
-			// また、pieces(Us)のうち今回移動させる駒は、実はすでに移動させてしまっているので、fromと書く。
-
-			if (discovered(from, to, ksq, prevSt->blockersForKing[~Us] & from))
-			{
-				auto directions = directions_of(from, ksq);
-				switch (pop_directions(directions)) {
-
-					// fromと敵玉とは同じ筋にあり、かつfromから駒を移動させて空き王手になる。
-					// つまりfromから上下を見ると、敵玉と、自分の開き王手をしている遠方駒(飛車 or 香)があるはずなのでこれを追加する。
-					// 敵玉はpieces(Us)なので含まれないはずであり、結果として自分の開き王手している駒だけが足される。
-
-					// rookEffect()を用いると、香での王手に対応するのが難しくなるので、
-					// 縦と横を場合分けするほうが簡単
-
-				case DIRECT_U: case DIRECT_D:
-					st->checkersBB |= rookFileEffect(from, pieces()) & pieces(Us); break;
-
-					// 横に利く遠方駒は飛車(+龍)しかないので、玉の位置から飛車の利きを求めてその利きのなかにいる飛車を足す。
-					// →　飛車の横だけの利きを求める関数を用意したので、それを用いると上と同様の手法で求まる。
-
-				case DIRECT_R: case DIRECT_L:
-					st->checkersBB |= rookRankEffect(from, pieces()) & pieces(Us); break;
-
-
-#if defined(USE_OLD_YANEURAOU_EFFECT)
-					// 斜めに利く遠方駒は角(+馬)しかないので、玉の位置から角の利きを求めてその利きのなかにいる角を足す。
-					// →　上と同様の方法が使える。discovered()により開き王手になることは確定している。
-
-				case DIRECT_RU: case DIRECT_LD:
-					st->checkersBB |= bishopEffect0(from, pieces()) & pieces(Us); break;
-
-				case DIRECT_RD: case DIRECT_LU:
-					st->checkersBB |= bishopEffect1(from, pieces()) & pieces(Us); break;
-#else
-
-				// magic bitboardを用いる場合の処理
-
-				// 斜め方向にあった駒を移動させての開き王手になっているので移動させた駒は角・馬ではない。
-				// (移動させた駒が角か馬であったなら、その駒で王を取れるので、非合法局面である)
-				// この移動させた駒はすでに取り除かれている。
-				// よって、王の升目から角が利いているUsの駒(角・馬)があれば、それは王手している遠方駒。
-
-				case DIRECT_RU: case DIRECT_LD:
-				case DIRECT_RD: case DIRECT_LU:
-					st->checkersBB |= bishopEffect(ksq, pieces()) & pieces(Us, BISHOP_HORSE); break;
-					
-#endif
-				default: UNREACHABLE;
-				}
-			}
-
-			// 差分更新したcheckersBBが正しく更新されているかをテストするためのassert
-			ASSERT_LV3(st->checkersBB == attackers_to(Us, king_square(~Us)));
-#else
-			// 差分更新しないとき用。
-			st->checkersBB = attackers_to(Us, king_square(~Us));
-#endif
-			st->continuousCheck[Us] = prev->continuousCheck[Us] + 2;
-
-		} else {
-
-			st->checkersBB = ZERO_BB;
-			st->continuousCheck[Us] = 0;
-		}
-	}
-	// 相手番のほうは関係ないので前ノードの値をそのまま受け継ぐ。
-	st->continuousCheck[~Us] = prev->continuousCheck[~Us];
-
-#if defined (USE_PIECE_VALUE)
-	st->materialValue = (Value)(st->previous->materialValue + (Us == BLACK ? materialDiff : -materialDiff));
-	//ASSERT_LV5(st->materialValue == Eval::material(*this));
-#endif
-
-	// 相手番に変更する。
-	sideToMove = ~Us;
-
-	// 更新されたhash keyをStateInfoに書き戻す。
-	st->board_key_ = k;
-	st->hand_key_ = h;
-
-	st->hand = hand[sideToMove];
-
-	// このタイミングで王手関係の情報を更新しておいてやる。
-	set_check_info<false>(st);
-
-	//ASSERT_LV5(evalList.is_valid(*this));
-
-	//state()->dirtyPiece.do_update(evalList);
-	//evalList.is_valid(*this);
-}
-
-#if defined(USE_KEY_AFTER)
-
-// ある指し手を指した後のhash keyを返す。
-Key Position::key_after(Move m) const {
-
-	Color Us = side_to_move();
-	auto k = st->board_key_ ^ Zobrist::side;
-	auto h = st->hand_key_;
-
-	// 移動先の升
-	Square to = to_sq(m);
-	ASSERT_LV2(is_ok(to));
-
-	if (is_drop(m))
-	{
-		// --- 駒打ち
-		PieceType pr = move_dropped_piece(m);
-		ASSERT_LV2(PAWN <= pr && pr < PIECE_HAND_NB);
-
-		Piece pc = make_piece(Us, pr);
-
-		// Zobrist keyの更新
-		h -= Zobrist::hand[Us][pr];
-		k += Zobrist::psq[to][pc];
-	}
-	else
-	{
-		// -- 駒の移動
-		Square from = from_sq(m);
-		ASSERT_LV2(is_ok(from));
-
-		// 移動させる駒
-		Piece moved_pc = piece_on(from);
-		ASSERT_LV2(moved_pc != NO_PIECE);
-
-		// 移動先に駒の配置
-		// もし成る指し手であるなら、成った後の駒を配置する。
-		Piece moved_after_pc;
-
-		if (is_promote(m))
-		{
-			moved_after_pc = moved_pc + PIECE_PROMOTE;
-		}
-		else {
-			moved_after_pc = moved_pc;
-		}
-
-		// 移動先の升にある駒
-		Piece to_pc = piece_on(to);
-		if (to_pc != NO_PIECE)
-		{
-			PieceType pr = raw_type_of(to_pc);
-
-			// 捕獲された駒が盤上から消えるので局面のhash keyを更新する
-			k -= Zobrist::psq[to][to_pc];
-			h += Zobrist::hand[Us][pr];
-		}
-
-		// fromにあったmoved_pcがtoにmoved_after_pcとして移動した。
-		k -= Zobrist::psq[from][moved_pc];
-		k += Zobrist::psq[to][moved_after_pc];
-	}
-
-	return k + h;
-}
-#endif
-
-// 指し手で盤面を1手戻す。do_move()の逆変換。
-template <Color Us>
-void Position::undo_move_impl(Move m)
-{
-	// Usは1手前の局面での手番(に呼び出し元でしてある)
-
-	auto to = to_sq(m);
-	ASSERT_LV2(is_ok(to));
-
-	// --- 移動後の駒
-
-	Piece moved_after_pc = moved_piece_after(m);
-
-#if defined (USE_EVAL_LIST)
-	PieceNumber piece_no = piece_no_of(to); // 移動元のpiece_no == いまtoの場所にある駒のpiece_no
-	ASSERT_LV3(is_ok(piece_no));
-#endif
-
-	// 移動前の駒
-	// Piece moved_pc = is_promote(m) ? (moved_after_pc - PIECE_PROMOTE) : moved_after_pc;
-
-	// ↑の処理、mの成りを表現するbitを直接、Pieceの成りを表現するbitに持ってきたほうが速い。
-	static_assert((u32)MOVE_PROMOTE / (u32)PIECE_PROMOTE == 4096,"");
-	// log(2)4096 == 12
-	Piece moved_pc = Piece(moved_after_pc ^ ((m & MOVE_PROMOTE) >> 12));
-
-	if (is_drop(m))
-	{
-		// --- 駒打ち
-
-		// toの場所にある駒を手駒に戻す
-		PieceType pt = raw_type_of(moved_after_pc);
-
-#if defined (USE_EVAL_LIST)
-		evalList.put_piece(piece_no, Us, pt, hand_count(hand[Us], pt));
-#endif
-
-		add_hand(hand[Us], pt);
-
-		// toの場所から駒を消す
-		remove_piece(to);
-
-#if defined(LONG_EFFECT_LIBRARY)
-		// 駒打ちのundoによる利きの復元
-		LongEffect::rewind_by_dropping_piece<Us>(*this, to, moved_after_pc);
-#endif
-
-	} else {
-
-		// --- 通常の指し手
-
-		auto from = from_sq(m);
-		ASSERT_LV2(is_ok(from));
-
-		// toの場所から駒を消す
-		remove_piece(to);
-
-		// toの地点には捕獲された駒があるならその駒が盤面に戻り、手駒から減る。
-		// 駒打ちの場合は捕獲された駒があるということはありえない。
-		// (なので駒打ちの場合は、st->capturedTypeを設定していないから参照してはならない)
-		if (st->capturedPiece != NO_PIECE)
-		{
-			Piece to_pc = st->capturedPiece;
-
-			// 盤面のtoの地点に捕獲されていた駒を復元する
-			put_piece(to, to_pc);
-			put_piece(from, moved_pc);
-
-#if defined (USE_EVAL_LIST)
-			PieceNumber piece_no2 = piece_no_of(Us, raw_type_of(to_pc)); // 捕っていた駒(手駒にある)のpiece_no
-			ASSERT_LV3(is_ok(piece_no2));
-
-			evalList.put_piece(piece_no2, to, to_pc);
-
-			// 手駒から減らす
-			sub_hand(hand[Us], raw_type_of(to_pc));
-
-			// 成りの指し手だったなら非成りの駒がfromの場所に戻る。さもなくばそのまま戻る。
-			// moved_pcが玉であることはあるが、いまkingSquareを更新してしまうと
-			// rewind_by_capturing_piece()でその位置を用いているのでまずい。(かも)
-			evalList.put_piece(piece_no, from , moved_pc);
-#else
-			// 手駒から減らす
-			sub_hand(hand[Us], raw_type_of(to_pc));
-#endif
-
-#if defined(LONG_EFFECT_LIBRARY)
-			// 移動先で駒を捕獲するときの利きの更新
-			LongEffect::rewind_by_capturing_piece<Us>(*this, from, to, moved_pc, moved_after_pc, to_pc);
-#endif
-
-		}
-		else {
-
-			put_piece(from, moved_pc);
-
-#if defined (USE_EVAL_LIST)
-			// 成りの指し手だったなら非成りの駒がfromの場所に戻る。さもなくばそのまま戻る。
-			evalList.put_piece(piece_no, from, moved_pc);
-#endif
-
-#if defined(LONG_EFFECT_LIBRARY)
-			// 移動先で駒を捕獲しないときの利きの更新
-			// このときに元あった玉の位置を用いるのでkingSquareはまだ更新してはならない。
-			LongEffect::rewind_by_no_capturing_piece<Us>(*this, from, to, moved_pc, moved_after_pc);
-#endif
-		}
-
-		if (type_of(moved_pc) == KING)
-			kingSquare[Us] = from;
-	}
-
-	// put_piece()などを使ったのでbitboardを更新する。
-	// kingSquareは自前で更新したのでupdate_kingSquare()を呼び出す必要はない。
-	update_bitboards();
-
-	// --- 相手番に変更
-	sideToMove = Us; // Usは先後入れ替えて呼び出されているはず。
-
-	// --- StateInfoを巻き戻す
-	st = st->previous;
-
-	--gamePly;
-
-	// ASSERT_LV5(evalList.is_valid(*this));
-	//evalList.is_valid(*this);
-}
-
-// do_move()を先後分けたdo_move_impl<>()を呼び出す。
-void Position::do_move(Move m, StateInfo& newSt, bool givesCheck)
-{
-	if (sideToMove == BLACK)
-		do_move_impl<BLACK>(m, newSt, givesCheck);
-	else
-		do_move_impl<WHITE>(m, newSt, givesCheck);
-}
-
-// undo_move()を先後分けたdo_move_impl<>()を呼び出す。
-void Position::undo_move(Move m)
-{
-	if (sideToMove == BLACK)
-		undo_move_impl<WHITE>(m); // 1手前の手番が返らないとややこしいので入れ替えておく。
-	else
-		undo_move_impl<BLACK>(m);
-}
-
-// null move searchに使われる。手番だけ変更する。
-void Position::do_null_move(StateInfo& newSt) {
-
-	ASSERT_LV3(!checkers());
-	ASSERT_LV3(&newSt != st);
-
-	// この場合、StateInfo自体は丸ごとコピーしておかないといけない。(他の初期化をしないので)
-	// よく考えると、StateInfo、新しく作る必要もないのだが…。まあ、CheckInfoがあるので仕方ないか…。
-	std::memcpy(&newSt, st, sizeof(StateInfo));
-
-	// TODO : NNUEの場合、accumulatorのコピー不要なのでは…？
-	//std::memcpy(&newSt, st, offsetof(StateInfo, accumulator));
-
-	newSt.previous = st;
-	st = &newSt;
-
-#if defined(EVAL_NNUE)
-	// NNUEの場合、KPPT型と違って、手番が違う場合、計算なしに済ますわけにはいかない。
-	st->accumulator.computed_score = false;
-#endif
-
-	st->board_key_ ^= Zobrist::side;
-
-	// このタイミングでアドレスが確定するのでprefetchしたほうが良い。(かも)
-	// →　将棋では評価関数の計算時のメモリ帯域がボトルネックになって、ここでprefetchしても
-	// 　prefetchのスケジューラーが処理しきれない可能性が…。
-	// CPUによっては有効なので一応やっておく。
-
-	const Key key = st->key();
-	prefetch(TT.first_entry(key));
-
-	// これは、さっきアクセスしたところのはずなので意味がない。
-	//  Eval::prefetch_evalhash(key);
-
-#if defined(EVAL_NNUE) && defined(USE_EVAL_HASH)
-	// NNUEのEvalHashの場合、手番が違うと異なるentry(のはず)
-	Eval::prefetch_evalhash(key);
-#endif
-
-	//++st->rule50;
-
-	st->pliesFromNull = 0;
-
-	sideToMove = ~sideToMove;
-
-	set_check_info<true>(st);
-
-	//st->repetition = 0;
-
-	//assert(pos_is_ok());
-
-}
-
-void Position::undo_null_move()
-{
-	ASSERT_LV3(!checkers());
-
-	st = st->previous;
-	sideToMove = ~sideToMove;
-}
-
-
-#if defined (USE_SEE)
+// 盤上の bit 数 - 1 で表現出来るようにする。持ち駒があると、盤上には Empty の 1 bit が増えるので、
+// これで局面の bit 数が固定化される。
+const HuffmanCode HuffmanCodedPos::handCodeTable[HandPieceNum][ColorNum] = {
+    {{Binary<        0>::value, 3}, {Binary<      100>::value, 3}}, // HPawn
+    {{Binary<        1>::value, 5}, {Binary<    10001>::value, 5}}, // HLance
+    {{Binary<       11>::value, 5}, {Binary<    10011>::value, 5}}, // HKnight
+    {{Binary<      101>::value, 5}, {Binary<    10101>::value, 5}}, // HSilver
+    {{Binary<      111>::value, 5}, {Binary<    10111>::value, 5}}, // HGold
+    {{Binary<    11111>::value, 7}, {Binary<  1011111>::value, 7}}, // HBishop
+    {{Binary<   111111>::value, 7}, {Binary<  1111111>::value, 7}}, // HRook
+};
+
+HuffmanCodeToPieceHash HuffmanCodedPos::boardCodeToPieceHash;
+HuffmanCodeToPieceHash HuffmanCodedPos::handCodeToPieceHash;
+
+const CharToPieceUSI g_charToPieceUSI;
 
 namespace {
+    const char* PieceToCharCSATable[PieceNone] = {
+        " * ", "+FU", "+KY", "+KE", "+GI", "+KA", "+HI", "+KI", "+OU", "+TO", "+NY", "+NK", "+NG", "+UM", "+RY", "", "",
+        "-FU", "-KY", "-KE", "-GI", "-KA", "-HI", "-KI", "-OU", "-TO", "-NY", "-NK", "-NG", "-UM", "-RY"
+    };
+    inline const char* pieceToCharCSA(const Piece pc) {
+        return PieceToCharCSATable[pc];
+    }
+    const char* PieceToCharUSITable[PieceNone] = {
+        "", "P", "L", "N", "S", "B", "R", "G", "K", "+P", "+L", "+N", "+S", "+B", "+R", "", "",
+        "p", "l", "n", "s", "b", "r", "g", "k", "+p", "+l", "+n", "+s", "+b", "+r"
+    };
+    inline const char* pieceToCharUSI(const Piece pc) {
+        return PieceToCharUSITable[pc];
+    }
+}
 
-	using namespace Eval;
-	using namespace Effect8;
+CheckInfo::CheckInfo(const Position& pos) {
+    const Color them = oppositeColor(pos.turn());
+    const Square ksq = pos.kingSquare(them);
 
-	// min_attacker()はsee_ge()で使われるヘルパー関数であり、(目的升toに利く)
-	// 手番側の最も価値の低い攻撃駒の場所を特定し、その見つけた駒をビットボードから取り除き
-	// その背後にあった遠方駒をスキャンする。(あればstmAttackersに追加する)
+    pinned = pos.pinnedBB();
+    dcBB = pos.discoveredCheckBB();
 
-	// またこの関数はmin_attacker<PAWN>()として最初呼び出され、PAWNの攻撃駒がなければ次に
-	// KNIGHTの..というように徐々に攻撃駒をアップグレードしていく。
+    checkBB[Pawn     ] = pos.attacksFrom<Pawn  >(them, ksq);
+    checkBB[Lance    ] = pos.attacksFrom<Lance >(them, ksq);
+    checkBB[Knight   ] = pos.attacksFrom<Knight>(them, ksq);
+    checkBB[Silver   ] = pos.attacksFrom<Silver>(them, ksq);
+    checkBB[Bishop   ] = pos.attacksFrom<Bishop>(ksq);
+    checkBB[Rook     ] = pos.attacksFrom<Rook  >(ksq);
+    checkBB[Gold     ] = pos.attacksFrom<Gold  >(them, ksq);
+    checkBB[King     ] = allZeroBB();
+    // todo: ここで AVX2 使えそう。
+    //       checkBB のreadアクセスは switch (pt) で場合分けして、余計なコピー減らした方が良いかも。
+    checkBB[ProPawn  ] = checkBB[Gold];
+    checkBB[ProLance ] = checkBB[Gold];
+    checkBB[ProKnight] = checkBB[Gold];
+    checkBB[ProSilver] = checkBB[Gold];
+    checkBB[Horse    ] = checkBB[Bishop] | pos.attacksFrom<King>(ksq);
+    checkBB[Dragon   ] = checkBB[Rook  ] | pos.attacksFrom<King>(ksq);
+}
 
-	// occupied = 駒のある場所のbitboard。今回発見された駒は取り除かれる。
-	// stmAttackers = 手番側の攻撃駒
-	// attackers = toに利く駒(先後両方)。min_attacker(toに利く最小の攻撃駒)を見つけたら、その駒を除去して
-	//  その影にいたtoに利く攻撃駒をattackersに追加する。
-	// uncapValue = 最後にこの駒が取れなかったときにこの駒が「成り」の指し手だった場合、その価値分の損失が
-	// 出るのでそれが返る。
+Bitboard Position::attacksFrom(const PieceType pt, const Color c, const Square sq, const Bitboard& occupied) {
+    switch (pt) {
+    case Occupied:  return allZeroBB();
+    case Pawn:      return pawnAttack(c, sq);
+    case Lance:     return lanceAttack(c, sq, occupied);
+    case Knight:    return knightAttack(c, sq);
+    case Silver:    return silverAttack(c, sq);
+    case Bishop:    return bishopAttack(sq, occupied);
+    case Rook:      return rookAttack(sq, occupied);
+    case Gold:
+    case ProPawn:
+    case ProLance:
+    case ProKnight:
+    case ProSilver: return goldAttack(c, sq);
+    case King:      return kingAttack(sq);
+    case Horse:     return horseAttack(sq, occupied);
+    case Dragon:    return dragonAttack(sq, occupied);
+    default:        UNREACHABLE; return allOneBB();
+    }
+}
 
-	// 返し値は今回発見されたtoに利く最小の攻撃駒。これがtoの地点において成れるなら成ったあとの駒を返すべき。
+// 実際に指し手が合法手かどうか判定
+// 連続王手の千日手は排除しない。
+// 確実に駒打ちではないときは、MUSTNOTDROP == true とする。
+// 確実に玉の移動で無いときは、FROMMUSTNOTKING == true とする。英語として正しい？
+// 遠隔駒で王手されているとき、その駒の利きがある場所に逃げる手を検出出来ない場合があるので、
+// そのような手を指し手生成してはいけない。
+template <bool MUSTNOTDROP, bool FROMMUSTNOTKING>
+bool Position::pseudoLegalMoveIsLegal(const Move move, const Bitboard& pinned) const {
+    // 駒打ちは、打ち歩詰めや二歩は指し手生成時や、killerをMovePicker::nextMove() 内で排除しているので、常に合法手
+    // (連続王手の千日手は省いていないけれど。)
+    if (!MUSTNOTDROP && move.isDrop())
+        return true;
+    assert(!move.isDrop());
 
-	PieceType min_attacker(const Position& pos, const Square& to
-		, const Bitboard& stmAttackers, Bitboard& occupied, Bitboard& attackers
-	) {
+    const Color us = turn();
+    const Square from = move.from();
 
-		// 駒種ごとのbitboardのうち、攻撃駒の候補を調べる
-	//:      Bitboard b = stmAttackers & bb[Pt];
+    if (!FROMMUSTNOTKING && pieceToPieceType(piece(from)) == King) {
+        const Color them = oppositeColor(us);
+        // 玉の移動先に相手の駒の利きがあれば、合法手でないので、false
+        return !attackersToIsAny(them, move.to());
+    }
+    // 玉以外の駒の移動
+    return !isPinnedIllegal(from, move.to(), kingSquare(us), pinned);
+}
 
-		// 歩、香、桂、銀、金(金相当の駒)、角、飛、馬、龍…の順で取るのに使う駒を調べる。
-		// 金相当の駒については、細かくしたほうが良いかどうかは微妙。
+template bool Position::pseudoLegalMoveIsLegal<false, false>(const Move move, const Bitboard& pinned) const;
+template bool Position::pseudoLegalMoveIsLegal<false, true >(const Move move, const Bitboard& pinned) const;
+template bool Position::pseudoLegalMoveIsLegal<true,  false>(const Move move, const Bitboard& pinned) const;
 
-		Bitboard b;
-		b = stmAttackers & pos.pieces(PAWN);   if (b) goto found;
-		b = stmAttackers & pos.pieces(LANCE);  if (b) goto found;
-		b = stmAttackers & pos.pieces(KNIGHT); if (b) goto found;
-		b = stmAttackers & pos.pieces(SILVER); if (b) goto found;
-		b = stmAttackers & pos.pieces(GOLDS);  if (b) goto found;
-		b = stmAttackers & pos.pieces(BISHOP); if (b) goto found;
-		b = stmAttackers & pos.pieces(ROOK);   if (b) goto found;
-		b = stmAttackers & pos.pieces(HORSE);  if (b) goto found;
-		b = stmAttackers & pos.pieces(DRAGON); if (b) goto found;
+bool Position::pseudoLegalMoveIsEvasion(const Move move, const Bitboard& pinned) const {
+    assert(isOK());
 
-		// 攻撃駒があるというのが前提条件だから、以上の駒で取れなければ、最後は玉でtoの升に移動出来て駒を取れるはず。
-		// 玉を移動させた結果、影になっていた遠方駒によってこの王が取られることはないから、
-		// sqに利く遠方駒が追加されることはなく、このままreturnすれば良い。
+    // 玉の移動
+    if (move.pieceTypeFrom() == King) {
+        // 遠隔駒で王手されたとき、王手している遠隔駒の利きには移動しないように指し手を生成している。
+        // その為、移動先に他の駒の利きが無いか調べるだけで良い。
+        const bool canMove = !attackersToIsAny(oppositeColor(turn()), move.to());
+        assert(canMove == (pseudoLegalMoveIsLegal<false, false>(move, pinned)));
+        return canMove;
+    }
 
-		return KING;
+    // 玉の移動以外
+    Bitboard target = checkersBB();
+    const Square checkSq = target.firstOneFromSQ11();
 
-	found:;
+    if (target)
+        // 両王手のとき、玉の移動以外の手は指せない。
+        return false;
 
-		// bにあった駒を取り除く
+    const Color us = turn();
+    const Square to = move.to();
+    // 移動、又は打った駒が、王手をさえぎるか、王手している駒を取る必要がある。
+    target = betweenBB(checkSq, kingSquare(us)) | checkersBB();
+    return target.isSet(to) && pseudoLegalMoveIsLegal<false, true>(move, pinned);
+}
 
-		Square sq = b.pop();
-		occupied ^= sq;
+// Searching: true なら探索時に内部で生成した手の合法手判定を行う。
+//            ttMove で hash 値が衝突した時などで、大駒の不成など明らかに価値の低い手が生成される事がある。
+//            これは非合法手として省いて良い。
+//            false なら、外部入力の合法手判定なので、ルールと同一の条件になる事が望ましい。
+template <bool Searching> bool Position::moveIsPseudoLegal(const Move move) const {
+    const Color us = turn();
+    const Color them = oppositeColor(us);
+    const Square to = move.to();
 
-		// このときpinされているかの判定を入れられるなら入れたほうが良いのだが…。
-		// この攻撃駒の種類によって場合分け
+    if (move.isDrop()) {
+        const PieceType ptFrom = move.pieceTypeDropped();
+        if (!hand(us).exists(pieceTypeToHandPiece(ptFrom)) || piece(to) != Empty)
+            return false;
 
-		// sqにあった駒が消えるので、toから見てsqの延長線上にある駒を追加する。
+        if (inCheck()) {
+            // 王手されているので、合駒でなければならない。
+            Bitboard target = checkersBB();
+            const Square checksq = target.firstOneFromSQ11();
 
-		auto dirs = directions_of(to, sq);
-		if (dirs) switch (pop_directions(dirs))
-		{
+            if (target)
+                // 両王手は合駒出来無い。
+                return false;
 
-#if defined(USE_OLD_YANEURAOU_EFFECT)
-		case DIRECT_RU: case DIRECT_LD:
-			// 斜め方向なら斜め方向の升をスキャンしてその上にある角・馬を足す
-			attackers |= bishopEffect0(to, occupied) & pos.pieces(BISHOP_HORSE);
+            target = betweenBB(checksq, kingSquare(us));
+            if (!target.isSet(to))
+                // 玉と、王手した駒との間に駒を打っていない。
+                return false;
+        }
 
-			ASSERT_LV3((bishopStepEffect(to) & sq));
-			break;
+        if (ptFrom == Pawn) {
+            if ((bbOf(Pawn, us) & fileMask(makeFile(to))))
+                // 二歩
+                return false;
+            const SquareDelta TDeltaN = (us == Black ? DeltaN : DeltaS);
+            if (to + TDeltaN == kingSquare(them) && isPawnDropCheckMate(us, to))
+                // 王手かつ打ち歩詰め
+                return false;
+        }
+    }
+    else {
+        const Square from = move.from();
+        const PieceType ptFrom = move.pieceTypeFrom();
+        if (piece(from) != colorAndPieceTypeToPiece(us, ptFrom) || bbOf(us).isSet(to))
+            return false;
 
-		case DIRECT_RD: case DIRECT_LU:
-			attackers |= bishopEffect1(to, occupied) & pos.pieces(BISHOP_HORSE);
-			ASSERT_LV3((bishopStepEffect(to) & sq));
-			break;
+        if (!attacksFrom(ptFrom, us, from).isSet(to))
+            return false;
+
+        if (Searching) {
+            switch (ptFrom) {
+            case Pawn  :
+                if (move.isPromotion()) {
+                    if (!canPromote(us, makeRank(to)))
+                        return false;
+                }
+                else if (canPromote(us, makeRank(to)))
+                    return false;
+                break;
+            case Lance :
+                if (move.isPromotion()) {
+                    if (!canPromote(us, makeRank(to)))
+                        return false;
+                }
+                else {
+                    // 1段目の不成は非合法なので省く。2段目の不成と3段目の駒を取らない不成もついでに省く。
+                    const Rank toRank = makeRank(to);
+                    if (us == Black ? isInFrontOf<Black, Rank3, Rank7>(toRank) : isInFrontOf<White, Rank3, Rank7>(toRank))
+                        return false;
+                    if (canPromote(us, toRank) && !move.isCapture())
+                        return false;
+                }
+                break;
+            case Knight:
+                // hash 値が衝突して別の局面の合法手の ttMove が入力されても、桂馬である事は確定。(桂馬は移動元、移動先が特殊なので。)
+                // よって、行きどころの無い駒になる move は生成されない。
+                // 特にチェックすべき事は無いので、break
+                break;
+            case Silver: case Bishop: case Rook  :
+                if (move.isPromotion())
+                    if (!canPromote(us, makeRank(to)) && !canPromote(us, makeRank(from)))
+                        return false;
+                break;
+            default: // 成れない駒
+                if (move.isPromotion())
+                    return false;
+            }
+        }
+
+        if (inCheck()) {
+            if (ptFrom == King) {
+                Bitboard occ = occupiedBB();
+                occ.clearBit(from);
+                if (attackersToIsAny(them, to, occ))
+                    // 王手から逃げていない。
+                    return false;
+            }
+            else {
+                // 玉以外の駒を移動させたとき。
+                Bitboard target = checkersBB();
+                const Square checksq = target.firstOneFromSQ11();
+
+                if (target)
+                    // 両王手なので、玉が逃げない手は駄目
+                    return false;
+
+                target = betweenBB(checksq, kingSquare(us)) | checkersBB();
+                if (!target.isSet(to))
+                    // 玉と、王手した駒との間に移動するか、王手した駒を取る以外は駄目。
+                    return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+template bool Position::moveIsPseudoLegal<true >(const Move move) const;
+template bool Position::moveIsPseudoLegal<false>(const Move move) const;
+
+#if !defined NDEBUG
+// 過去(又は現在)に生成した指し手が現在の局面でも有効か判定。
+// あまり速度が要求される場面で使ってはいけない。
+bool Position::moveIsLegal(const Move move) const {
+    return MoveList<LegalAll>(*this).contains(move);
+}
+#endif
+
+// 局面の更新
+void Position::doMove(const Move move, StateInfo& newSt) {
+    const CheckInfo ci(*this);
+    doMove(move, newSt, ci, moveGivesCheck(move, ci));
+}
+
+// 局面の更新
+void Position::doMove(const Move move, StateInfo& newSt, const CheckInfo& ci, const bool moveIsCheck) {
+    assert(isOK());
+    assert(move);
+    assert(&newSt != st_);
+
+    Key boardKey = getBoardKey();
+    Key handKey = getHandKey();
+    boardKey ^= zobTurn();
+
+    memcpy(&newSt, st_, offsetof(StateInfo, boardKey));
+    newSt.previous = st_;
+    st_ = &newSt;
+
+    st_->cl.size = 1;
+
+    const Color us = turn();
+    const Square to = move.to();
+    const PieceType ptCaptured = move.cap();
+    PieceType ptTo;
+    if (move.isDrop()) {
+        ptTo = move.pieceTypeDropped();
+        const HandPiece hpTo = pieceTypeToHandPiece(ptTo);
+
+        handKey -= zobHand(hpTo, us);
+        boardKey += zobrist(ptTo, to, us);
+
+        prefetch(csearcher()->tt.firstEntry(boardKey + handKey));
+
+        const int handnum = hand(us).numOf(hpTo);
+        const int listIndex = evalList_.squareHandToList[HandPieceToSquareHand[us][hpTo] + handnum];
+        const Piece pcTo = colorAndPieceTypeToPiece(us, ptTo);
+        st_->cl.listindex[0] = listIndex;
+        st_->cl.clistpair[0].oldlist[0] = evalList_.list0[listIndex];
+        st_->cl.clistpair[0].oldlist[1] = evalList_.list1[listIndex];
+
+        evalList_.list0[listIndex] = kppArray[pcTo         ] + to;
+        evalList_.list1[listIndex] = kppArray[inverse(pcTo)] + inverse(to);
+        evalList_.listToSquareHand[listIndex] = to;
+        evalList_.squareHandToList[to] = listIndex;
+
+        st_->cl.clistpair[0].newlist[0] = evalList_.list0[listIndex];
+        st_->cl.clistpair[0].newlist[1] = evalList_.list1[listIndex];
+
+        hand_[us].minusOne(hpTo);
+        xorBBs(ptTo, to, us);
+        piece_[to] = colorAndPieceTypeToPiece(us, ptTo);
+
+        if (moveIsCheck) {
+            // Direct checks
+            st_->checkersBB = setMaskBB(to);
+            st_->continuousCheck[us] += 2;
+        }
+        else {
+            st_->checkersBB = allZeroBB();
+            st_->continuousCheck[us] = 0;
+        }
+    }
+    else {
+        const Square from = move.from();
+        const PieceType ptFrom = move.pieceTypeFrom();
+        ptTo = move.pieceTypeTo(ptFrom);
+
+        byTypeBB_[ptFrom].xorBit(from);
+        byTypeBB_[ptTo].xorBit(to);
+        byColorBB_[us].xorBit(from, to);
+        piece_[from] = Empty;
+        piece_[to] = colorAndPieceTypeToPiece(us, ptTo);
+        boardKey -= zobrist(ptFrom, from, us);
+        boardKey += zobrist(ptTo, to, us);
+
+        if (ptCaptured) {
+            // 駒を取ったとき
+            const HandPiece hpCaptured = pieceTypeToHandPiece(ptCaptured);
+            const Color them = oppositeColor(us);
+
+            boardKey -= zobrist(ptCaptured, to, them);
+            handKey += zobHand(hpCaptured, us);
+
+            byTypeBB_[ptCaptured].xorBit(to);
+            byColorBB_[them].xorBit(to);
+
+            hand_[us].plusOne(hpCaptured);
+            const int toListIndex = evalList_.squareHandToList[to];
+            st_->cl.listindex[1] = toListIndex;
+            st_->cl.clistpair[1].oldlist[0] = evalList_.list0[toListIndex];
+            st_->cl.clistpair[1].oldlist[1] = evalList_.list1[toListIndex];
+            st_->cl.size = 2;
+
+            const int handnum = hand(us).numOf(hpCaptured);
+            evalList_.list0[toListIndex] = kppHandArray[us  ][hpCaptured] + handnum;
+            evalList_.list1[toListIndex] = kppHandArray[them][hpCaptured] + handnum;
+            const Square squarehand = HandPieceToSquareHand[us][hpCaptured] + handnum;
+            evalList_.listToSquareHand[toListIndex] = squarehand;
+            evalList_.squareHandToList[squarehand]  = toListIndex;
+
+            st_->cl.clistpair[1].newlist[0] = evalList_.list0[toListIndex];
+            st_->cl.clistpair[1].newlist[1] = evalList_.list1[toListIndex];
+
+            st_->material += (us == Black ? capturePieceScore(ptCaptured) : -capturePieceScore(ptCaptured));
+        }
+        prefetch(csearcher()->tt.firstEntry(boardKey + handKey));
+        // Occupied は to, from の位置のビットを操作するよりも、
+        // Black と White の or を取る方が速いはず。
+        byTypeBB_[Occupied] = bbOf(Black) | bbOf(White);
+
+        if (ptTo == King)
+            kingSquare_[us] = to;
+        else {
+            const Piece pcTo = colorAndPieceTypeToPiece(us, ptTo);
+            const int fromListIndex = evalList_.squareHandToList[from];
+
+            st_->cl.listindex[0] = fromListIndex;
+            st_->cl.clistpair[0].oldlist[0] = evalList_.list0[fromListIndex];
+            st_->cl.clistpair[0].oldlist[1] = evalList_.list1[fromListIndex];
+
+            evalList_.list0[fromListIndex] = kppArray[pcTo         ] + to;
+            evalList_.list1[fromListIndex] = kppArray[inverse(pcTo)] + inverse(to);
+            evalList_.listToSquareHand[fromListIndex] = to;
+            evalList_.squareHandToList[to] = fromListIndex;
+
+            st_->cl.clistpair[0].newlist[0] = evalList_.list0[fromListIndex];
+            st_->cl.clistpair[0].newlist[1] = evalList_.list1[fromListIndex];
+        }
+
+        if (move.isPromotion())
+            st_->material += (us == Black ? (pieceScore(ptTo) - pieceScore(ptFrom)) : -(pieceScore(ptTo) - pieceScore(ptFrom)));
+
+        if (moveIsCheck) {
+            // Direct checks
+            st_->checkersBB = ci.checkBB[ptTo] & setMaskBB(to);
+
+            // Discovery checks
+            const Square ksq = kingSquare(oppositeColor(us));
+            if (isDiscoveredCheck(from, to, ksq, ci.dcBB)) {
+                switch (squareRelation(from, ksq)) {
+                case DirecMisc: assert(false); break; // 最適化の為のダミー
+                case DirecFile:
+                    // from の位置から縦に利きを調べると相手玉と、空き王手している駒に当たっているはず。味方の駒が空き王手している駒。
+                    st_->checkersBB |= rookAttackFile(from, occupiedBB()) & bbOf(us);
+                    break;
+                case DirecRank:
+                    st_->checkersBB |= attacksFrom<Rook>(ksq) & bbOf(Rook, Dragon, us);
+                    break;
+                case DirecDiagNESW: case DirecDiagNWSE:
+                    st_->checkersBB |= attacksFrom<Bishop>(ksq) & bbOf(Bishop, Horse, us);
+                    break;
+                default: UNREACHABLE;
+                }
+            }
+            st_->continuousCheck[us] += 2;
+        }
+        else {
+            st_->checkersBB = allZeroBB();
+            st_->continuousCheck[us] = 0;
+        }
+    }
+    goldsBB_ = bbOf(Gold, ProPawn, ProLance, ProKnight, ProSilver);
+
+    st_->boardKey = boardKey;
+    st_->handKey = handKey;
+    ++st_->pliesFromNull;
+
+    turn_ = oppositeColor(us);
+    st_->hand = hand(turn());
+
+    assert(isOK());
+}
+
+void Position::undoMove(const Move move) {
+    assert(isOK());
+    assert(move);
+
+    const Color them = turn();
+    const Color us = oppositeColor(them);
+    const Square to = move.to();
+    turn_ = us;
+    // ここで先に turn_ を戻したので、以下、move は us の指し手とする。
+    if (move.isDrop()) {
+        const PieceType ptTo = move.pieceTypeDropped();
+        byTypeBB_[ptTo].xorBit(to);
+        byColorBB_[us].xorBit(to);
+        piece_[to] = Empty;
+
+        const HandPiece hp = pieceTypeToHandPiece(ptTo);
+        hand_[us].plusOne(hp);
+
+        const int toListIndex  = evalList_.squareHandToList[to];
+        const int handnum = hand(us).numOf(hp);
+        evalList_.list0[toListIndex] = kppHandArray[us  ][hp] + handnum;
+        evalList_.list1[toListIndex] = kppHandArray[them][hp] + handnum;
+        const Square squarehand = HandPieceToSquareHand[us][hp] + handnum;
+        evalList_.listToSquareHand[toListIndex] = squarehand;
+        evalList_.squareHandToList[squarehand]  = toListIndex;
+    }
+    else {
+        const Square from = move.from();
+        const PieceType ptFrom = move.pieceTypeFrom();
+        const PieceType ptTo = move.pieceTypeTo(ptFrom);
+        const PieceType ptCaptured = move.cap(); // todo: st_->capturedType 使えば良い。
+
+        if (ptTo == King)
+            kingSquare_[us] = from;
+        else {
+            const Piece pcFrom = colorAndPieceTypeToPiece(us, ptFrom);
+            const int toListIndex = evalList_.squareHandToList[to];
+            evalList_.list0[toListIndex] = kppArray[pcFrom         ] + from;
+            evalList_.list1[toListIndex] = kppArray[inverse(pcFrom)] + inverse(from);
+            evalList_.listToSquareHand[toListIndex] = from;
+            evalList_.squareHandToList[from] = toListIndex;
+        }
+
+        if (ptCaptured) {
+            // 駒を取ったとき
+            byTypeBB_[ptCaptured].xorBit(to);
+            byColorBB_[them].xorBit(to);
+            const HandPiece hpCaptured = pieceTypeToHandPiece(ptCaptured);
+            const Piece pcCaptured = colorAndPieceTypeToPiece(them, ptCaptured);
+            piece_[to] = pcCaptured;
+
+            const int handnum = hand(us).numOf(hpCaptured);
+            const int toListIndex = evalList_.squareHandToList[HandPieceToSquareHand[us][hpCaptured] + handnum];
+            evalList_.list0[toListIndex] = kppArray[pcCaptured         ] + to;
+            evalList_.list1[toListIndex] = kppArray[inverse(pcCaptured)] + inverse(to);
+            evalList_.listToSquareHand[toListIndex] = to;
+            evalList_.squareHandToList[to] = toListIndex;
+
+            hand_[us].minusOne(hpCaptured);
+        }
+        else
+            // 駒を取らないときは、colorAndPieceTypeToPiece(us, ptCaptured) は 0 または 16 になる。
+            // 16 になると困るので、駒を取らないときは明示的に Empty にする。
+            piece_[to] = Empty;
+        byTypeBB_[ptFrom].xorBit(from);
+        byTypeBB_[ptTo].xorBit(to);
+        byColorBB_[us].xorBit(from, to);
+        piece_[from] = colorAndPieceTypeToPiece(us, ptFrom);
+    }
+    // Occupied は to, from の位置のビットを操作するよりも、
+    // Black と White の or を取る方が速いはず。
+    byTypeBB_[Occupied] = bbOf(Black) | bbOf(White);
+    goldsBB_ = bbOf(Gold, ProPawn, ProLance, ProKnight, ProSilver);
+
+    // key などは StateInfo にまとめられているので、
+    // previous のポインタを st_ に代入するだけで良い。
+    st_ = st_->previous;
+
+    assert(isOK());
+}
+
+namespace {
+    // SEE の順番
+    template <PieceType PT> struct SEENextPieceType {}; // これはインスタンス化しない。
+    template <> struct SEENextPieceType<Pawn     > { static const PieceType value = Lance;     };
+    template <> struct SEENextPieceType<Lance    > { static const PieceType value = Knight;    };
+    template <> struct SEENextPieceType<Knight   > { static const PieceType value = ProPawn;   };
+    template <> struct SEENextPieceType<ProPawn  > { static const PieceType value = ProLance;  };
+    template <> struct SEENextPieceType<ProLance > { static const PieceType value = ProKnight; };
+    template <> struct SEENextPieceType<ProKnight> { static const PieceType value = Silver;    };
+    template <> struct SEENextPieceType<Silver   > { static const PieceType value = ProSilver; };
+    template <> struct SEENextPieceType<ProSilver> { static const PieceType value = Gold;      };
+    template <> struct SEENextPieceType<Gold     > { static const PieceType value = Bishop;    };
+    template <> struct SEENextPieceType<Bishop   > { static const PieceType value = Horse;     };
+    template <> struct SEENextPieceType<Horse    > { static const PieceType value = Rook;      };
+    template <> struct SEENextPieceType<Rook     > { static const PieceType value = Dragon;    };
+    template <> struct SEENextPieceType<Dragon   > { static const PieceType value = King;      };
+
+    template <PieceType PT> FORCE_INLINE PieceType nextAttacker(const Position& pos, const Square to, const Bitboard& opponentAttackers,
+                                                                Bitboard& occupied, Bitboard& attackers, const Color turn)
+    {
+        if (opponentAttackers.andIsAny(pos.bbOf(PT))) {
+            const Bitboard bb = opponentAttackers & pos.bbOf(PT);
+            const Square from = bb.constFirstOneFromSQ11();
+            occupied.xorBit(from);
+            // todo: 実際に移動した方向を基にattackersを更新すれば、template, inline を使用しなくても良さそう。
+            //       その場合、キャッシュに乗りやすくなるので逆に速くなるかも。
+            if (PT == Pawn || PT == Lance)
+                attackers |= (lanceAttack(oppositeColor(turn), to, occupied) & (pos.bbOf(Rook, Dragon) | pos.bbOf(Lance, turn)));
+            if (PT == Gold || PT == ProPawn || PT == ProLance || PT == ProKnight || PT == ProSilver || PT == Horse || PT == Dragon)
+                attackers |= (lanceAttack(oppositeColor(turn), to, occupied) & pos.bbOf(Lance, turn))
+                    | (lanceAttack(turn, to, occupied) & pos.bbOf(Lance, oppositeColor(turn)))
+                    | (rookAttack(to, occupied) & pos.bbOf(Rook, Dragon))
+                    | (bishopAttack(to, occupied) & pos.bbOf(Bishop, Horse));
+            if (PT == Silver)
+                attackers |= (lanceAttack(oppositeColor(turn), to, occupied) & pos.bbOf(Lance, turn))
+                    | (rookAttack(to, occupied) & pos.bbOf(Rook, Dragon))
+                    | (bishopAttack(to, occupied) & pos.bbOf(Bishop, Horse));
+            if (PT == Bishop)
+                attackers |= (bishopAttack(to, occupied) & pos.bbOf(Bishop, Horse));
+            if (PT == Rook)
+                attackers |= (lanceAttack(oppositeColor(turn), to, occupied) & pos.bbOf(Lance, turn))
+                    | (lanceAttack(turn, to, occupied) & pos.bbOf(Lance, oppositeColor(turn)))
+                    | (rookAttack(to, occupied) & pos.bbOf(Rook, Dragon));
+
+            if (PT == Pawn || PT == Lance || PT == Knight)
+                if (canPromote(turn, makeRank(to)))
+                    return PT + PTPromote;
+            if (PT == Silver || PT == Bishop || PT == Rook)
+                if (canPromote(turn, makeRank(to)) || canPromote(turn, makeRank(from)))
+                    return PT + PTPromote;
+            return PT;
+        }
+        return nextAttacker<SEENextPieceType<PT>::value>(pos, to, opponentAttackers, occupied, attackers, turn);
+    }
+    template <> FORCE_INLINE PieceType nextAttacker<King>(const Position&, const Square, const Bitboard&,
+                                                          Bitboard&, Bitboard&, const Color)
+    {
+        return King;
+    }
+}
+
+Score Position::see(const Move move, const int asymmThreshold) const {
+    const Square to = move.to();
+    Square from;
+    PieceType ptCaptured;
+    Bitboard occ = occupiedBB();
+    Bitboard attackers;
+    Bitboard opponentAttackers;
+    Color turn = oppositeColor(this->turn());
+    Score swapList[32];
+    if (move.isDrop()) {
+        opponentAttackers = attackersTo(turn, to, occ);
+        if (!opponentAttackers)
+            return ScoreZero;
+        attackers = opponentAttackers | attackersTo(oppositeColor(turn), to, occ);
+        swapList[0] = ScoreZero;
+        ptCaptured = move.pieceTypeDropped();
+    }
+    else {
+        from = move.from();
+        occ.xorBit(from);
+        opponentAttackers = attackersTo(turn, to, occ);
+        if (!opponentAttackers) {
+            if (move.isPromotion()) {
+                const PieceType ptFrom = move.pieceTypeFrom();
+                return capturePieceScore(move.cap()) + promotePieceScore(ptFrom);
+            }
+            return capturePieceScore(move.cap());
+        }
+        attackers = opponentAttackers | attackersTo(oppositeColor(turn), to, occ);
+        swapList[0] = capturePieceScore(move.cap());
+        ptCaptured = move.pieceTypeFrom();
+        if (move.isPromotion()) {
+            const PieceType ptFrom = move.pieceTypeFrom();
+            swapList[0] += promotePieceScore(ptFrom);
+            ptCaptured += PTPromote;
+        }
+    }
+
+    int slIndex = 1;
+    do {
+        swapList[slIndex] = -swapList[slIndex - 1] + capturePieceScore(ptCaptured);
+
+        ptCaptured = nextAttacker<Pawn>(*this, to, opponentAttackers, occ, attackers, turn);
+
+        attackers &= occ;
+        ++slIndex;
+        turn = oppositeColor(turn);
+        opponentAttackers = attackers & bbOf(turn);
+
+        if (ptCaptured == King) {
+            if (opponentAttackers)
+                swapList[slIndex++] = CaptureKingScore;
+            break;
+        }
+    } while (opponentAttackers);
+
+    if (asymmThreshold) {
+        for (int i = 0; i < slIndex; i += 2) {
+            if (swapList[i] < asymmThreshold)
+                swapList[i] = -CaptureKingScore;
+        }
+    }
+
+    // nega max 的に駒の取り合いの点数を求める。
+    while (--slIndex)
+        swapList[slIndex-1] = std::min(-swapList[slIndex], swapList[slIndex-1]);
+    return swapList[0];
+}
+
+Score Position::seeSign(const Move move) const {
+    if (move.isCapture()) {
+        const PieceType ptFrom = move.pieceTypeFrom();
+        const Square to = move.to();
+        if (capturePieceScore(ptFrom) <= capturePieceScore(piece(to)))
+            return static_cast<Score>(1);
+    }
+    return see(move);
+}
+
+namespace {
+    // them(相手) 側の玉が逃げられるか。
+    // sq : 王手した相手の駒の位置。紐付きか、桂馬の位置とする。よって、玉は sq には行けない。
+    // bb : sq の利きのある場所のBitboard。よって、玉は bb のビットが立っている場所には行けない。
+    // sq と ksq の位置の Occupied Bitboard のみは、ここで更新して評価し、元に戻す。
+    // (実際にはテンポラリのOccupied Bitboard を使うので、元には戻さない。)
+    bool canKingEscape(const Position& pos, const Color us, const Square sq, const Bitboard& bb) {
+        const Color them = oppositeColor(us);
+        const Square ksq = pos.kingSquare(them);
+        Bitboard kingMoveBB = bb.notThisAnd(pos.bbOf(them).notThisAnd(kingAttack(ksq)));
+        kingMoveBB.clearBit(sq); // sq には行けないので、クリアする。xorBit(sq)ではダメ。
+
+        if (kingMoveBB) {
+            Bitboard tempOccupied = pos.occupiedBB();
+            tempOccupied.setBit(sq);
+            tempOccupied.clearBit(ksq);
+            do {
+                const Square to = kingMoveBB.firstOneFromSQ11();
+                // 玉の移動先に、us 側の利きが無ければ、true
+                if (!pos.attackersToIsAny(us, to, tempOccupied))
+                    return true;
+            } while (kingMoveBB);
+        }
+        // 玉の移動先が無い。
+        return false;
+    }
+    // them(相手) 側の玉以外の駒が sq にある us 側の駒を取れるか。
+    bool canPieceCapture(const Position& pos, const Color them, const Square sq, const Bitboard& dcBB) {
+        // 玉以外で打った駒を取れる相手側の駒の Bitboard
+        Bitboard fromBB = pos.attackersToExceptKing(them, sq);
+
+        if (fromBB) {
+            const Square ksq = pos.kingSquare(them);
+            do {
+                const Square from = fromBB.firstOneFromSQ11();
+                if (!pos.isDiscoveredCheck(from, sq, ksq, dcBB))
+                    // them 側から見て、pin されていない駒で、打たれた駒を取れるので、true
+                    return true;
+            } while (fromBB);
+        }
+        // 玉以外の駒で、打った駒を取れない。
+        return false;
+    }
+
+    // pos.discoveredCheckBB<false>() を遅延評価するバージョン。
+    bool canPieceCapture(const Position& pos, const Color them, const Square sq) {
+        Bitboard fromBB = pos.attackersToExceptKing(them, sq);
+
+        if (fromBB) {
+            const Square ksq = pos.kingSquare(them);
+            const Bitboard dcBB = pos.discoveredCheckBB<false>();
+            do {
+                const Square from = fromBB.firstOneFromSQ11();
+                if (!pos.isDiscoveredCheck(from, sq, ksq, dcBB))
+                    // them 側から見て、pin されていない駒で、打たれた駒を取れるので、true
+                    return true;
+            } while (fromBB);
+        }
+        // 玉以外の駒で、打った駒を取れない。
+        return false;
+    }
+}
+
+// us が sq へ歩を打ったとき、them の玉が詰むか。
+// us が sq へ歩を打つのは王手であると仮定する。
+// 打ち歩詰めのとき、true を返す。
+bool Position::isPawnDropCheckMate(const Color us, const Square sq) const {
+    const Color them = oppositeColor(us);
+    // 玉以外の駒で、打たれた歩が取れるなら、打ち歩詰めではない。
+    if (canPieceCapture(*this, them, sq))
+        return false;
+    // todo: ここで玉の位置を求めるのは、上位で求めたものと2重になるので無駄。後で整理すること。
+    const Square ksq = kingSquare(them);
+
+    // 玉以外で打った歩を取れないとき、玉が歩を取るか、玉が逃げるか。
+
+    // 利きを求める際に、occupied の歩を打った位置の bit を立てた Bitboard を使用する。
+    // ここでは歩の Bitboard は更新する必要がない。
+    // color の Bitboard も更新する必要がない。(相手玉が動くとき、こちらの打った歩で玉を取ることは無い為。)
+    const Bitboard tempOccupied = occupiedBB() | setMaskBB(sq);
+    Bitboard kingMoveBB = bbOf(them).notThisAnd(kingAttack(ksq));
+
+    // 少なくとも歩を取る方向には玉が動けるはずなので、do while を使用。
+    assert(kingMoveBB);
+    do {
+        const Square to = kingMoveBB.firstOneFromSQ11();
+        if (!attackersToIsAny(us, to, tempOccupied))
+            // 相手玉の移動先に自駒の利きがないなら、打ち歩詰めではない。
+            return false;
+    } while (kingMoveBB);
+
+    return true;
+}
+
+inline void Position::xorBBs(const PieceType pt, const Square sq, const Color c) {
+    byTypeBB_[Occupied].xorBit(sq);
+    byTypeBB_[pt].xorBit(sq);
+    byColorBB_[c].xorBit(sq);
+}
+
+// 相手玉が1手詰みかどうかを判定。
+// 1手詰みなら、詰みに至る指し手の一部の情報(from, to のみとか)を返す。
+// 1手詰みでないなら、Move::moveNone() を返す。
+// Bitboard の状態を途中で更新する為、const 関数ではない。(更新後、元に戻すが。)
+template <Color US> Move Position::mateMoveIn1Ply() {
+    const Color Them = oppositeColor(US);
+    const Square ksq = kingSquare(Them);
+    const SquareDelta TDeltaS = (US == Black ? DeltaS : DeltaN);
+
+    assert(!attackersToIsAny(Them, kingSquare(US)));
+
+    // 駒打ちを調べる。
+    const Bitboard dropTarget = nOccupiedBB(); // emptyBB() ではないので注意して使うこと。
+    const Hand ourHand = hand(US);
+    // 王手する前の状態の dcBB。
+    // 間にある駒は相手側の駒。
+    // 駒打ちのときは、打った後も、打たれる前の状態の dcBB を使用する。
+    const Bitboard dcBB_betweenIsThem = discoveredCheckBB<false>();
+
+    // 飛車打ち
+    if (ourHand.exists<HRook>()) {
+        // 合駒されるとややこしいので、3手詰み関数の中で調べる。
+        // ここでは離れた位置から王手するのは考えない。
+        Bitboard toBB = dropTarget & rookStepAttacks(ksq);
+        while (toBB) {
+            const Square to = toBB.firstOneFromSQ11();
+            // 駒を打った場所に自駒の利きがあるか。(無ければ玉で取られて詰まない)
+            if (attackersToIsAny(US, to)) {
+                // 玉が逃げられず、他の駒で取ることも出来ないか
+                if (!canKingEscape(*this, US, to, rookAttackToEdge(to))
+                    && !canPieceCapture(*this, Them, to, dcBB_betweenIsThem))
+                {
+                    return makeDropMove(Rook, to);
+                }
+            }
+        }
+    }
+    // 香車打ち
+    // 飛車で詰まなければ香車でも詰まないので、else if を使用。
+    // 玉が 9(1) 段目にいれば香車で王手出来無いので、それも省く。
+    else if (ourHand.exists<HLance>() && isInFrontOf<US, Rank9, Rank1>(makeRank(ksq))) {
+        const Square to = ksq + TDeltaS;
+        if (piece(to) == Empty && attackersToIsAny(US, to)) {
+            if (!canKingEscape(*this, US, to, lanceAttackToEdge(US, to))
+                && !canPieceCapture(*this, Them, to, dcBB_betweenIsThem))
+            {
+                return makeDropMove(Lance, to);
+            }
+        }
+    }
+
+    // 角打ち
+    if (ourHand.exists<HBishop>()) {
+        Bitboard toBB = dropTarget & bishopStepAttacks(ksq);
+        while (toBB) {
+            const Square to = toBB.firstOneFromSQ11();
+            if (attackersToIsAny(US, to)) {
+                if (!canKingEscape(*this, US, to, bishopAttackToEdge(to))
+                    && !canPieceCapture(*this, Them, to, dcBB_betweenIsThem))
+                {
+                    return makeDropMove(Bishop, to);
+                }
+            }
+        }
+    }
+
+    // 金打ち
+    if (ourHand.exists<HGold>()) {
+        Bitboard toBB;
+        if (ourHand.exists<HRook>())
+            // 飛車打ちを先に調べたので、尻金だけは省く。
+            toBB = dropTarget & (goldAttack(Them, ksq) ^ pawnAttack(US, ksq));
+        else
+            toBB = dropTarget & goldAttack(Them, ksq);
+        while (toBB) {
+            const Square to = toBB.firstOneFromSQ11();
+            if (attackersToIsAny(US, to)) {
+                if (!canKingEscape(*this, US, to, goldAttack(US, to))
+                    && !canPieceCapture(*this, Them, to, dcBB_betweenIsThem))
+                {
+                    return makeDropMove(Gold, to);
+                }
+            }
+        }
+    }
+
+    if (ourHand.exists<HSilver>()) {
+        Bitboard toBB;
+        if (ourHand.exists<HGold>()) {
+            // 金打ちを先に調べたので、斜め後ろから打つ場合だけを調べる。
+
+            if (ourHand.exists<HBishop>())
+                // 角打ちを先に調べたので、斜めからの王手も除外できる。銀打ちを調べる必要がない。
+                goto silver_drop_end;
+            // 斜め後ろから打つ場合を調べる必要がある。
+            toBB = dropTarget & (silverAttack(Them, ksq) & inFrontMask(US, makeRank(ksq)));
+        }
+        else {
+            if (ourHand.exists<HBishop>())
+                // 斜め後ろを除外。前方から打つ場合を調べる必要がある。
+                toBB = dropTarget & goldAndSilverAttacks(Them, ksq);
+            else
+                toBB = dropTarget & silverAttack(Them, ksq);
+        }
+        while (toBB) {
+            const Square to = toBB.firstOneFromSQ11();
+            if (attackersToIsAny(US, to)) {
+                if (!canKingEscape(*this, US, to, silverAttack(US, to))
+                    && !canPieceCapture(*this, Them, to, dcBB_betweenIsThem))
+                {
+                    return makeDropMove(Silver, to);
+                }
+            }
+        }
+    }
+silver_drop_end:
+
+    if (ourHand.exists<HKnight>()) {
+        Bitboard toBB = dropTarget & knightAttack(Them, ksq);
+        while (toBB) {
+            const Square to = toBB.firstOneFromSQ11();
+            // 桂馬は紐が付いている必要はない。
+            // よって、このcanKingEscape() 内での to の位置に逃げられないようにする処理は無駄。
+            if (!canKingEscape(*this, US, to, allZeroBB())
+                && !canPieceCapture(*this, Them, to, dcBB_betweenIsThem))
+            {
+                return makeDropMove(Knight, to);
+            }
+        }
+    }
+
+    // 歩打ちで詰ますと反則なので、調べない。
+
+    // 駒を移動する場合
+    // moveTarget は桂馬以外の移動先の大まかな位置。飛角香の遠隔王手は含まない。
+    const Bitboard moveTarget = bbOf(US).notThisAnd(kingAttack(ksq));
+    const Bitboard pinned = pinnedBB();
+    const Bitboard dcBB_betweenIsUs = discoveredCheckBB<true>();
+
+    {
+        // 竜による移動
+        Bitboard fromBB = bbOf(Dragon, US);
+        while (fromBB) {
+            const Square from = fromBB.firstOneFromSQ11();
+            // 遠隔王手は考えない。
+            Bitboard toBB = moveTarget & attacksFrom<Dragon>(from);
+            if (toBB) {
+                xorBBs(Dragon, from, US);
+                // 動いた後の dcBB: to の位置の occupied や checkers は関係ないので、ここで生成できる。
+                const Bitboard dcBB_betweenIsThem_after = discoveredCheckBB<false>();
+                // to の位置の Bitboard は canKingEscape の中で更新する。
+                do {
+                    const Square to = toBB.firstOneFromSQ11();
+                    // 王手した駒の場所に自駒の利きがあるか。(無ければ玉で取られて詰まない)
+                    if (unDropCheckIsSupported(US, to)) {
+                        // 玉が逃げられない
+                        // かつ、(空き王手 または 他の駒で取れない)
+                        // かつ、王手した駒が pin されていない
+                        if (!canKingEscape(*this, US, to, attacksFrom<Dragon>(to, occupiedBB() ^ setMaskBB(ksq)))
+                            && (isDiscoveredCheck(from, to, ksq, dcBB_betweenIsUs)
+                                || !canPieceCapture(*this, Them, to, dcBB_betweenIsThem_after))
+                            && !isPinnedIllegal(from, to, kingSquare(US), pinned))
+                        {
+                            xorBBs(Dragon, from, US);
+                            return makeCaptureMove(Dragon, from, to, *this);
+                        }
+                    }
+                } while (toBB);
+                xorBBs(Dragon, from, US);
+            }
+        }
+    }
+
+    // Txxx は先手、後手の情報を吸収した変数。数字は先手に合わせている。
+    const Rank TRank4 = (US == Black ? Rank4 : Rank6);
+    const Bitboard TRank123BB = inFrontMask<US, TRank4>();
+    {
+        // 飛車による移動
+        Bitboard fromBB = bbOf(Rook, US);
+        Bitboard fromOn123BB = fromBB & TRank123BB;
+        // from が 123 段目
+        if (fromOn123BB) {
+            fromBB.andEqualNot(TRank123BB);
+            do {
+                const Square from = fromOn123BB.firstOneFromSQ11();
+                Bitboard toBB = moveTarget & attacksFrom<Rook>(from);
+                if (toBB) {
+                    xorBBs(Rook, from, US);
+                    // 動いた後の dcBB: to の位置の occupied や checkers は関係ないので、ここで生成できる。
+                    const Bitboard dcBB_betweenIsThem_after = discoveredCheckBB<false>();
+                    // to の位置の Bitboard は canKingEscape の中で更新する。
+                    do {
+                        const Square to = toBB.firstOneFromSQ11();
+                        if (unDropCheckIsSupported(US, to)) {
+                            if (!canKingEscape(*this, US, to, attacksFrom<Dragon>(to, occupiedBB() ^ setMaskBB(ksq)))
+                                && (isDiscoveredCheck(from, to, ksq, dcBB_betweenIsUs)
+                                    || !canPieceCapture(*this, Them, to, dcBB_betweenIsThem_after))
+                                && !isPinnedIllegal(from, to, kingSquare(US), pinned))
+                            {
+                                xorBBs(Rook, from, US);
+                                return makeCapturePromoteMove(Rook, from, to, *this);
+                            }
+                        }
+                    } while (toBB);
+                    xorBBs(Rook, from, US);
+                }
+            } while (fromOn123BB);
+        }
+
+        // from が 4~9 段目
+        while (fromBB) {
+            const Square from = fromBB.firstOneFromSQ11();
+            Bitboard toBB = moveTarget & attacksFrom<Rook>(from) & (rookStepAttacks(ksq) | TRank123BB);
+            if (toBB) {
+                xorBBs(Rook, from, US);
+                // 動いた後の dcBB: to の位置の occupied や checkers は関係ないので、ここで生成できる。
+                const Bitboard dcBB_betweenIsThem_after = discoveredCheckBB<false>();
+
+                Bitboard toOn123BB = toBB & TRank123BB;
+                // 成り
+                if (toOn123BB) {
+                    do {
+                        const Square to = toOn123BB.firstOneFromSQ11();
+                        if (unDropCheckIsSupported(US, to)) {
+                            if (!canKingEscape(*this, US, to, attacksFrom<Dragon>(to, occupiedBB() ^ setMaskBB(ksq)))
+                                && (isDiscoveredCheck(from, to, ksq, dcBB_betweenIsUs)
+                                    || !canPieceCapture(*this, Them, to, dcBB_betweenIsThem_after))
+                                && !isPinnedIllegal(from, to, kingSquare(US), pinned))
+                            {
+                                xorBBs(Rook, from, US);
+                                return makeCapturePromoteMove(Rook, from, to, *this);
+                            }
+                        }
+                    } while (toOn123BB);
+
+                    toBB.andEqualNot(TRank123BB);
+                }
+                // 不成
+                while (toBB) {
+                    const Square to = toBB.firstOneFromSQ11();
+                    if (unDropCheckIsSupported(US, to)) {
+                        if (!canKingEscape(*this, US, to, rookAttackToEdge(to))
+                            && (isDiscoveredCheck(from, to, ksq, dcBB_betweenIsUs)
+                                || !canPieceCapture(*this, Them, to, dcBB_betweenIsThem_after))
+                            && !isPinnedIllegal(from, to, kingSquare(US), pinned))
+                        {
+                            xorBBs(Rook, from, US);
+                            return makeCaptureMove(Rook, from, to, *this);
+                        }
+                    }
+                }
+                xorBBs(Rook, from, US);
+            }
+        }
+    }
+
+    {
+        // 馬による移動
+        Bitboard fromBB = bbOf(Horse, US);
+        while (fromBB) {
+            const Square from = fromBB.firstOneFromSQ11();
+            // 遠隔王手は考えない。
+            Bitboard toBB = moveTarget & attacksFrom<Horse>(from);
+            if (toBB) {
+                xorBBs(Horse, from, US);
+                // 動いた後の dcBB: to の位置の occupied や checkers は関係ないので、ここで生成できる。
+                const Bitboard dcBB_betweenIsThem_after = discoveredCheckBB<false>();
+                // to の位置の Bitboard は canKingEscape の中で更新する。
+                do {
+                    const Square to = toBB.firstOneFromSQ11();
+                    // 王手した駒の場所に自駒の利きがあるか。(無ければ玉で取られて詰まない)
+                    if (unDropCheckIsSupported(US, to)) {
+                        // 玉が逃げられない
+                        // かつ、(空き王手 または 他の駒で取れない)
+                        // かつ、動かした駒が pin されていない)
+                        if (!canKingEscape(*this, US, to, horseAttackToEdge(to)) // 竜の場合と違って、常に最大の利きを使用して良い。
+                            && (isDiscoveredCheck(from, to, ksq, dcBB_betweenIsUs)
+                                || !canPieceCapture(*this, Them, to, dcBB_betweenIsThem_after))
+                            && !isPinnedIllegal(from, to, kingSquare(US), pinned))
+                        {
+                            xorBBs(Horse, from, US);
+                            return makeCaptureMove(Horse, from, to, *this);
+                        }
+                    }
+                } while (toBB);
+                xorBBs(Horse, from, US);
+            }
+        }
+    }
+
+    {
+        // 角による移動
+        Bitboard fromBB = bbOf(Bishop, US);
+        Bitboard fromOn123BB = fromBB & TRank123BB;
+        // from が 123 段目
+        if (fromOn123BB) {
+            fromBB.andEqualNot(TRank123BB);
+            do {
+                const Square from = fromOn123BB.firstOneFromSQ11();
+                Bitboard toBB = moveTarget & attacksFrom<Bishop>(from);
+                if (toBB) {
+                    xorBBs(Bishop, from, US);
+                    // 動いた後の dcBB: to の位置の occupied や checkers は関係ないので、ここで生成できる。
+                    const Bitboard dcBB_betweenIsThem_after = discoveredCheckBB<false>();
+                    // to の位置の Bitboard は canKingEscape の中で更新する。
+                    do {
+                        const Square to = toBB.firstOneFromSQ11();
+                        if (unDropCheckIsSupported(US, to)) {
+                            if (!canKingEscape(*this, US, to, horseAttackToEdge(to))
+                                && (isDiscoveredCheck(from, to, ksq, dcBB_betweenIsUs)
+                                    || !canPieceCapture(*this, Them, to, dcBB_betweenIsThem_after))
+                                && !isPinnedIllegal(from, to, kingSquare(US), pinned))
+                            {
+                                xorBBs(Bishop, from, US);
+                                return makeCapturePromoteMove(Bishop, from, to, *this);
+                            }
+                        }
+                    } while (toBB);
+                    xorBBs(Bishop, from, US);
+                }
+            } while (fromOn123BB);
+        }
+
+        // from が 4~9 段目
+        while (fromBB) {
+            const Square from = fromBB.firstOneFromSQ11();
+            Bitboard toBB = moveTarget & attacksFrom<Bishop>(from) & (bishopStepAttacks(ksq) | TRank123BB);
+            if (toBB) {
+                xorBBs(Bishop, from, US);
+                // 動いた後の dcBB: to の位置の occupied や checkers は関係ないので、ここで生成できる。
+                const Bitboard dcBB_betweenIsThem_after = discoveredCheckBB<false>();
+
+                Bitboard toOn123BB = toBB & TRank123BB;
+                // 成り
+                if (toOn123BB) {
+                    do {
+                        const Square to = toOn123BB.firstOneFromSQ11();
+                        if (unDropCheckIsSupported(US, to)) {
+                            if (!canKingEscape(*this, US, to, horseAttackToEdge(to))
+                                && (isDiscoveredCheck(from, to, ksq, dcBB_betweenIsUs)
+                                    || !canPieceCapture(*this, Them, to, dcBB_betweenIsThem_after))
+                                && !isPinnedIllegal(from, to, kingSquare(US), pinned))
+                            {
+                                xorBBs(Bishop, from, US);
+                                return makeCapturePromoteMove(Bishop, from, to, *this);
+                            }
+                        }
+                    } while (toOn123BB);
+
+                    toBB.andEqualNot(TRank123BB);
+                }
+                // 不成
+                while (toBB) {
+                    const Square to = toBB.firstOneFromSQ11();
+                    if (unDropCheckIsSupported(US, to)) {
+                        if (!canKingEscape(*this, US, to, bishopAttackToEdge(to))
+                            && (isDiscoveredCheck(from, to, ksq, dcBB_betweenIsUs)
+                                || !canPieceCapture(*this, Them, to, dcBB_betweenIsThem_after))
+                            && !isPinnedIllegal(from, to, kingSquare(US), pinned))
+                        {
+                            xorBBs(Bishop, from, US);
+                            return makeCaptureMove(Bishop, from, to, *this);
+                        }
+                    }
+                }
+                xorBBs(Bishop, from, US);
+            }
+        }
+    }
+
+    {
+        // 金、成り金による移動
+        Bitboard fromBB = goldsBB(US) & goldCheckTable(US, ksq);
+        while (fromBB) {
+            const Square from = fromBB.firstOneFromSQ11();
+            Bitboard toBB = moveTarget & attacksFrom<Gold>(US, from) & attacksFrom<Gold>(Them, ksq);
+            if (toBB) {
+                const PieceType pt = pieceToPieceType(piece(from));
+                xorBBs(pt, from, US);
+                goldsBB_.xorBit(from);
+                // 動いた後の dcBB: to の位置の occupied や checkers は関係ないので、ここで生成できる。
+                const Bitboard dcBB_betweenIsThem_after = discoveredCheckBB<false>();
+                // to の位置の Bitboard は canKingEscape の中で更新する。
+                do {
+                    const Square to = toBB.firstOneFromSQ11();
+                    // 王手した駒の場所に自駒の利きがあるか。(無ければ玉で取られて詰まない)
+                    if (unDropCheckIsSupported(US, to)) {
+                        // 玉が逃げられない
+                        // かつ、(空き王手 または 他の駒で取れない)
+                        // かつ、動かした駒が pin されていない)
+                        if (!canKingEscape(*this, US, to, attacksFrom<Gold>(US, to))
+                            && (isDiscoveredCheck(from, to, ksq, dcBB_betweenIsUs)
+                                || !canPieceCapture(*this, Them, to, dcBB_betweenIsThem_after))
+                            && !isPinnedIllegal(from, to, kingSquare(US), pinned))
+                        {
+                            xorBBs(pt, from, US);
+                            goldsBB_.xorBit(from);
+                            return makeCaptureMove(pt, from, to, *this);
+                        }
+                    }
+                } while (toBB);
+                xorBBs(pt, from, US);
+                goldsBB_.xorBit(from);
+            }
+        }
+    }
+
+    {
+        // 銀による移動
+        Bitboard fromBB = bbOf(Silver, US) & silverCheckTable(US, ksq);
+        if (fromBB) {
+            // Txxx は先手、後手の情報を吸収した変数。数字は先手に合わせている。
+            const Bitboard TRank5_9BB = inFrontMask<Them, TRank4>();
+            const Bitboard chkBB = attacksFrom<Silver>(Them, ksq);
+            const Bitboard chkBB_promo = attacksFrom<Gold>(Them, ksq);
+
+            Bitboard fromOn123BB = fromBB & TRank123BB;
+            // from が敵陣
+            if (fromOn123BB) {
+                fromBB.andEqualNot(TRank123BB);
+                do {
+                    const Square from = fromOn123BB.firstOneFromSQ11();
+                    Bitboard toBB = moveTarget & attacksFrom<Silver>(US, from);
+                    Bitboard toBB_promo = toBB & chkBB_promo;
+
+                    toBB &= chkBB;
+                    if ((toBB_promo | toBB)) {
+                        xorBBs(Silver, from, US);
+                        // 動いた後の dcBB: to の位置の occupied や checkers は関係ないので、ここで生成できる。
+                        const Bitboard dcBB_betweenIsThem_after = discoveredCheckBB<false>();
+                        // to の位置の Bitboard は canKingEscape の中で更新する。
+                        while (toBB_promo) {
+                            const Square to = toBB_promo.firstOneFromSQ11();
+                            if (unDropCheckIsSupported(US, to)) {
+                                // 成り
+                                if (!canKingEscape(*this, US, to, attacksFrom<Gold>(US, to))
+                                    && (isDiscoveredCheck(from, to, ksq, dcBB_betweenIsUs)
+                                        || !canPieceCapture(*this, Them, to, dcBB_betweenIsThem_after))
+                                    && !isPinnedIllegal(from, to, kingSquare(US), pinned))
+                                {
+                                    xorBBs(Silver, from, US);
+                                    return makeCapturePromoteMove(Silver, from, to, *this);
+                                }
+                            }
+                        }
+
+                        // 玉の前方に移動する場合、成で詰まなかったら不成でも詰まないので、ここで省く。
+                        // sakurapyon の作者が言ってたので実装。
+                        toBB.andEqualNot(inFrontMask(Them, makeRank(ksq)));
+                        while (toBB) {
+                            const Square to = toBB.firstOneFromSQ11();
+                            if (unDropCheckIsSupported(US, to)) {
+                                // 不成
+                                if (!canKingEscape(*this, US, to, attacksFrom<Silver>(US, to))
+                                    && (isDiscoveredCheck(from, to, ksq, dcBB_betweenIsUs)
+                                        || !canPieceCapture(*this, Them, to, dcBB_betweenIsThem_after))
+                                    && !isPinnedIllegal(from, to, kingSquare(US), pinned))
+                                {
+                                    xorBBs(Silver, from, US);
+                                    return makeCaptureMove(Silver, from, to, *this);
+                                }
+                            }
+                        }
+
+                        xorBBs(Silver, from, US);
+                    }
+                } while (fromOn123BB);
+            }
+
+            // from が 5~9段目 (必ず不成)
+            Bitboard fromOn5_9BB = fromBB & TRank5_9BB;
+            if (fromOn5_9BB) {
+                fromBB.andEqualNot(TRank5_9BB);
+                do {
+                    const Square from = fromOn5_9BB.firstOneFromSQ11();
+                    Bitboard toBB = moveTarget & attacksFrom<Silver>(US, from) & chkBB;
+
+                    if (toBB) {
+                        xorBBs(Silver, from, US);
+                        // 動いた後の dcBB, pinned: to の位置の occupied や checkers は関係ないので、ここで生成できる。
+                        const Bitboard dcBB_betweenIsThem_after = discoveredCheckBB<false>();
+                        // to の位置の Bitboard は canKingEscape の中で更新する。
+                        while (toBB) {
+                            const Square to = toBB.firstOneFromSQ11();
+                            if (unDropCheckIsSupported(US, to)) {
+                                // 不成
+                                if (!canKingEscape(*this, US, to, attacksFrom<Silver>(US, to))
+                                    && (isDiscoveredCheck(from, to, ksq, dcBB_betweenIsUs)
+                                        || !canPieceCapture(*this, Them, to, dcBB_betweenIsThem_after))
+                                    && !isPinnedIllegal(from, to, kingSquare(US), pinned))
+                                {
+                                    xorBBs(Silver, from, US);
+                                    return makeCaptureMove(Silver, from, to, *this);
+                                }
+                            }
+                        }
+
+                        xorBBs(Silver, from, US);
+                    }
+                } while (fromOn5_9BB);
+            }
+
+            // 残り 4 段目のみ
+            // 前進するときは成れるが、後退するときは成れない。
+            while (fromBB) {
+                const Square from = fromBB.firstOneFromSQ11();
+                Bitboard toBB = moveTarget & attacksFrom<Silver>(US, from);
+                Bitboard toBB_promo = toBB & TRank123BB & chkBB_promo; // 3 段目にしか成れない。
+
+                toBB &= chkBB;
+                if ((toBB_promo | toBB)) {
+                    xorBBs(Silver, from, US);
+                    // 動いた後の dcBB: to の位置の occupied や checkers は関係ないので、ここで生成できる。
+                    const Bitboard dcBB_betweenIsThem_after = discoveredCheckBB<false>();
+                    // to の位置の Bitboard は canKingEscape の中で更新する。
+                    while (toBB_promo) {
+                        const Square to = toBB_promo.firstOneFromSQ11();
+                        if (unDropCheckIsSupported(US, to)) {
+                            // 成り
+                            if (!canKingEscape(*this, US, to, attacksFrom<Gold>(US, to))
+                                && (isDiscoveredCheck(from, to, ksq, dcBB_betweenIsUs)
+                                    || !canPieceCapture(*this, Them, to, dcBB_betweenIsThem_after))
+                                && !isPinnedIllegal(from, to, kingSquare(US), pinned))
+                            {
+                                xorBBs(Silver, from, US);
+                                return makeCapturePromoteMove(Silver, from, to, *this);
+                            }
+                        }
+                    }
+
+                    while (toBB) {
+                        const Square to = toBB.firstOneFromSQ11();
+                        if (unDropCheckIsSupported(US, to)) {
+                            // 不成
+                            if (!canKingEscape(*this, US, to, attacksFrom<Silver>(US, to))
+                                && (isDiscoveredCheck(from, to, ksq, dcBB_betweenIsUs)
+                                    || !canPieceCapture(*this, Them, to, dcBB_betweenIsThem_after))
+                                && !isPinnedIllegal(from, to, kingSquare(US), pinned))
+                            {
+                                xorBBs(Silver, from, US);
+                                return makeCaptureMove(Silver, from, to, *this);
+                            }
+                        }
+                    }
+
+                    xorBBs(Silver, from, US);
+                }
+            }
+        }
+    }
+
+    {
+        // 桂による移動
+        Bitboard fromBB = bbOf(Knight, US) & knightCheckTable(US, ksq);
+        if (fromBB) {
+            const Bitboard chkBB_promo = attacksFrom<Gold>(Them, ksq) & TRank123BB;
+            const Bitboard chkBB = attacksFrom<Knight>(Them, ksq);
+
+            do {
+                const Square from = fromBB.firstOneFromSQ11();
+                Bitboard toBB = bbOf(US).notThisAnd(attacksFrom<Knight>(US, from));
+                Bitboard toBB_promo = toBB & chkBB_promo;
+                toBB &= chkBB;
+                if ((toBB_promo | toBB)) {
+                    xorBBs(Knight, from, US);
+                    // 動いた後の dcBB: to の位置の occupied や checkers は関係ないので、ここで生成できる。
+                    const Bitboard dcBB_betweenIsThem_after = discoveredCheckBB<false>();
+                    // to の位置の Bitboard は canKingEscape の中で更新する。
+                    while (toBB_promo) {
+                        const Square to = toBB_promo.firstOneFromSQ11();
+                        if (unDropCheckIsSupported(US, to)) {
+                            // 成り
+                            if (!canKingEscape(*this, US, to, attacksFrom<Gold>(US, to))
+                                && (isDiscoveredCheck<true>(from, to, ksq, dcBB_betweenIsUs)
+                                    || !canPieceCapture(*this, Them, to, dcBB_betweenIsThem_after))
+                                && !isPinnedIllegal<true>(from, to, kingSquare(US), pinned))
+                            {
+                                xorBBs(Knight, from, US);
+                                return makeCapturePromoteMove(Knight, from, to, *this);
+                            }
+                        }
+                    }
+
+                    while (toBB) {
+                        const Square to = toBB.firstOneFromSQ11();
+                        // 桂馬は紐が付いてなくて良いので、紐が付いているかは調べない。
+                        // 不成
+                        if (!canKingEscape(*this, US, to, allZeroBB())
+                            && (isDiscoveredCheck<true>(from, to, ksq, dcBB_betweenIsUs)
+                                || !canPieceCapture(*this, Them, to, dcBB_betweenIsThem_after))
+                            && !isPinnedIllegal<true>(from, to, kingSquare(US), pinned))
+                        {
+                            xorBBs(Knight, from, US);
+                            return makeCaptureMove(Knight, from, to, *this);
+                        }
+                    }
+                    xorBBs(Knight, from, US);
+                }
+            } while (fromBB);
+        }
+    }
+
+    {
+        // 香車による移動
+        Bitboard fromBB = bbOf(Lance, US) & lanceCheckTable(US, ksq);
+        if (fromBB) {
+            // Txxx は先手、後手の情報を吸収した変数。数字は先手に合わせている。
+            const SquareDelta TDeltaS = (US == Black ? DeltaS : DeltaN);
+            const Rank TRank2 = (US == Black ? Rank2 : Rank8);
+            const Bitboard chkBB_promo = attacksFrom<Gold>(Them, ksq) & TRank123BB;
+            // 玉の前方1マスのみ。
+            // 玉が 1 段目にいるときは、成のみで良いので省く。
+            const Bitboard chkBB = attacksFrom<Pawn>(Them, ksq) & inFrontMask<Them, TRank2>();
+
+            do {
+                const Square from = fromBB.firstOneFromSQ11();
+                Bitboard toBB = moveTarget & attacksFrom<Lance>(US, from);
+                Bitboard toBB_promo = toBB & chkBB_promo;
+
+                toBB &= chkBB;
+
+                if ((toBB_promo | toBB)) {
+                    xorBBs(Lance, from, US);
+                    // 動いた後の dcBB: to の位置の occupied や checkers は関係ないので、ここで生成できる。
+                    const Bitboard dcBB_betweenIsThem_after = discoveredCheckBB<false>();
+                    // to の位置の Bitboard は canKingEscape の中で更新する。
+
+                    while (toBB_promo) {
+                        const Square to = toBB_promo.firstOneFromSQ11();
+                        if (unDropCheckIsSupported(US, to)) {
+                            // 成り
+                            if (!canKingEscape(*this, US, to, attacksFrom<Gold>(US, to))
+                                && (isDiscoveredCheck(from, to, ksq, dcBB_betweenIsUs)
+                                    || !canPieceCapture(*this, Them, to, dcBB_betweenIsThem_after))
+                                && !isPinnedIllegal(from, to, kingSquare(US), pinned))
+                            {
+                                xorBBs(Lance, from, US);
+                                return makeCapturePromoteMove(Lance, from, to, *this);
+                            }
+                        }
+                    }
+
+                    if (toBB) {
+                        assert(toBB.isOneBit());
+                        // 不成で王手出来るのは、一つの場所だけなので、ループにする必要が無い。
+                        const Square to = ksq + TDeltaS;
+                        if (unDropCheckIsSupported(US, to)) {
+                            // 不成
+                            if (!canKingEscape(*this, US, to, lanceAttackToEdge(US, to))
+                                && (isDiscoveredCheck(from, to, ksq, dcBB_betweenIsUs)
+                                    || !canPieceCapture(*this, Them, to, dcBB_betweenIsThem_after))
+                                && !isPinnedIllegal(from, to, kingSquare(US), pinned))
+                            {
+                                xorBBs(Lance, from, US);
+                                return makeCaptureMove(Lance, from, to, *this);
+                            }
+                        }
+                    }
+                    xorBBs(Lance, from, US);
+                }
+            } while (fromBB);
+        }
+    }
+
+    {
+        // 歩による移動
+        // 成れる場合は必ずなる。
+        // todo: PawnCheckBB 作って簡略化する。
+        const Rank krank = makeRank(ksq);
+        // 歩が移動して王手になるのは、相手玉が1~7段目の時のみ。
+        if (isInFrontOf<US, Rank8, Rank2>(krank)) {
+            // Txxx は先手、後手の情報を吸収した変数。数字は先手に合わせている。
+            const SquareDelta TDeltaS = (US == Black ? DeltaS : DeltaN);
+            const SquareDelta TDeltaN = (US == Black ? DeltaN : DeltaS);
+
+            Bitboard fromBB = bbOf(Pawn, US);
+            // 玉が敵陣にいないと成で王手になることはない。
+            if (isInFrontOf<US, Rank4, Rank6>(krank)) {
+                // 成った時に王手になる位置
+                const Bitboard toBB_promo = moveTarget & attacksFrom<Gold>(Them, ksq) & TRank123BB;
+                Bitboard fromBB_promo = fromBB & pawnAttack<Them>(toBB_promo);
+                while (fromBB_promo) {
+                    const Square from = fromBB_promo.firstOneFromSQ11();
+                    const Square to = from + TDeltaN;
+
+                    xorBBs(Pawn, from, US);
+                    // 動いた後の dcBB: to の位置の occupied や checkers は関係ないので、ここで生成できる。
+                    const Bitboard dcBB_betweenIsThem_after = discoveredCheckBB<false>();
+                    // to の位置の Bitboard は canKingEscape の中で更新する。
+                    if (unDropCheckIsSupported(US, to)) {
+                        // 成り
+                        if (!canKingEscape(*this, US, to, attacksFrom<Gold>(US, to))
+                            && (isDiscoveredCheck(from, to, ksq, dcBB_betweenIsUs)
+                                || !canPieceCapture(*this, Them, to, dcBB_betweenIsThem_after))
+                            && !isPinnedIllegal(from, to, kingSquare(US), pinned))
+                        {
+                            xorBBs(Pawn, from, US);
+                            return makeCapturePromoteMove(Pawn, from, to, *this);
+                        }
+                    }
+                    xorBBs(Pawn, from, US);
+                }
+            }
+
+            // 不成
+            // 玉が 8,9 段目にいることは無いので、from,to が隣の筋を指すことは無い。
+            const Square to = ksq + TDeltaS;
+            const Square from = to + TDeltaS;
+            if (fromBB.isSet(from) && !bbOf(US).isSet(to)) {
+                // 玉が 1, 2 段目にいるなら、成りで王手出来るので不成は調べない。
+                if (isBehind<US, Rank2, Rank8>(krank)) {
+                    xorBBs(Pawn, from, US);
+                    // 動いた後の dcBB: to の位置の occupied や checkers は関係ないので、ここで生成できる。
+                    const Bitboard dcBB_betweenIsThem_after = discoveredCheckBB<false>();
+                    // to の位置の Bitboard は canKingEscape の中で更新する。
+                    if (unDropCheckIsSupported(US, to)) {
+                        // 不成
+                        if (!canKingEscape(*this, US, to, allZeroBB())
+                            && (isDiscoveredCheck(from, to, ksq, dcBB_betweenIsUs)
+                                || !canPieceCapture(*this, Them, to, dcBB_betweenIsThem_after))
+                            && !isPinnedIllegal(from, to, kingSquare(US), pinned))
+                        {
+                            xorBBs(Pawn, from, US);
+                            return makeCaptureMove(Pawn, from, to, *this);
+                        }
+                    }
+                    xorBBs(Pawn, from, US);
+                }
+            }
+        }
+    }
+
+    return Move::moveNone();
+}
+
+Move Position::mateMoveIn1Ply() {
+    return (turn() == Black ? mateMoveIn1Ply<Black>() : mateMoveIn1Ply<White>());
+}
+
+void Position::initZobrist() {
+    // zobTurn_ は 1 であり、その他は 1桁目を使わない。
+    // zobTurn のみ xor で更新する為、他の桁に影響しないようにする為。
+    // hash値の更新は普通は全て xor を使うが、持ち駒の更新の為に +, - を使用した方が都合が良い。
+    for (PieceType pt = Occupied; pt < PieceTypeNum; ++pt) {
+        for (Square sq = SQ11; sq < SquareNum; ++sq) {
+            for (Color c = Black; c < ColorNum; ++c)
+                zobrist_[pt][sq][c] = g_mt64bit.random() & ~UINT64_C(1);
+        }
+    }
+    for (HandPiece hp = HPawn; hp < HandPieceNum; ++hp) {
+        zobHand_[hp][Black] = g_mt64bit.random() & ~UINT64_C(1);
+        zobHand_[hp][White] = g_mt64bit.random() & ~UINT64_C(1);
+    }
+    zobExclusion_ = g_mt64bit.random() & ~UINT64_C(1);
+}
+
+void Position::print() const {
+    std::cout << "'  9  8  7  6  5  4  3  2  1" << std::endl;
+    int i = 0;
+    for (Rank r = Rank1; r < RankNum; ++r) {
+        ++i;
+        std::cout << "P" << i;
+        for (File f = File9; File1 <= f; --f)
+            std::cout << pieceToCharCSA(piece(makeSquare(f, r)));
+        std::cout << std::endl;
+    }
+    printHand(Black);
+    printHand(White);
+    std::cout << (turn() == Black ? "+" : "-") << std::endl;
+    std::cout << std::endl;
+    std::cout << "key = " << getKey() << std::endl;
+}
+
+std::string Position::toSFEN(const Ply ply) const {
+    std::stringstream ss;
+    ss << "sfen ";
+    int space = 0;
+    for (Rank rank = Rank1; rank <= Rank9; ++rank) {
+        for (File file = File9; file >= File1; --file) {
+            const Square sq = makeSquare(file, rank);
+            const Piece pc = piece(sq);
+            if (pc == Empty)
+                ++space;
+            else {
+                if (space) {
+                    ss << space;
+                    space = 0;
+                }
+                ss << pieceToCharUSI(pc);
+            }
+        }
+        if (space) {
+            ss << space;
+            space = 0;
+        }
+        if (rank != Rank9)
+            ss << "/";
+    }
+    ss << (turn() == Black ? " b " : " w ");
+    if (hand(Black).value() == 0 && hand(White).value() == 0)
+        ss << "- ";
+    else {
+        // USI の規格として、持ち駒の表記順は決まっており、先手、後手の順で、それぞれ 飛、角、金、銀、桂、香、歩 の順。
+        for (Color color = Black; color < ColorNum; ++color) {
+            for (HandPiece hp : {HRook, HBishop, HGold, HSilver, HKnight, HLance, HPawn}) {
+                const int num = hand(color).numOf(hp);
+                if (num == 0)
+                    continue;
+                if (num != 1)
+                    ss << num;
+                const Piece pc = colorAndHandPieceToPiece(color, hp);
+                ss << pieceToCharUSI(pc);
+            }
+        }
+        ss << " ";
+    }
+    ss << ply;
+    return ss.str();
+}
+
+HuffmanCodedPos Position::toHuffmanCodedPos() const {
+    HuffmanCodedPos result;
+    result.clear();
+    BitStream bs(result.data);
+    // 手番 (1bit)
+    bs.putBit(turn());
+
+    // 玉の位置 (7bit * 2)
+    bs.putBits(kingSquare(Black), 7);
+    bs.putBits(kingSquare(White), 7);
+
+    // 盤上の駒
+    for (Square sq = SQ11; sq < SquareNum; ++sq) {
+        Piece pc = piece(sq);
+        if (pieceToPieceType(pc) == King)
+            continue;
+        const auto hc = HuffmanCodedPos::boardCodeTable[pc];
+        bs.putBits(hc.code, hc.numOfBits);
+    }
+
+    // 持ち駒
+    for (Color c = Black; c < ColorNum; ++c) {
+        const Hand h = hand(c);
+        for (HandPiece hp = HPawn; hp < HandPieceNum; ++hp) {
+            const auto hc = HuffmanCodedPos::handCodeTable[hp][c];
+            for (u32 n = 0; n < h.numOf(hp); ++n)
+                bs.putBits(hc.code, hc.numOfBits);
+        }
+    }
+    assert(bs.data() == std::end(result.data));
+    assert(bs.curr() == 0);
+    return result;
+}
+
+#if !defined NDEBUG
+bool Position::isOK() const {
+    static Key prevKey;
+    const bool debugAll = true;
+
+    const bool debugBitboards    = debugAll || false;
+    const bool debugKingCount    = debugAll || false;
+    const bool debugKingCapture  = debugAll || false;
+    const bool debugCheckerCount = debugAll || false;
+    const bool debugKey          = debugAll || false;
+    const bool debugStateHand    = debugAll || false;
+    const bool debugPiece        = debugAll || false;
+    const bool debugMaterial     = debugAll || false;
+
+    int failedStep = 0;
+    if (debugBitboards) {
+        if ((bbOf(Black) & bbOf(White)))
+            goto incorrect_position;
+        if ((bbOf(Black) | bbOf(White)) != occupiedBB())
+            goto incorrect_position;
+        if ((bbOf(Pawn     ) ^ bbOf(Lance    ) ^ bbOf(Knight) ^ bbOf(Silver ) ^ bbOf(Bishop  ) ^
+             bbOf(Rook     ) ^ bbOf(Gold     ) ^ bbOf(King  ) ^ bbOf(ProPawn) ^ bbOf(ProLance) ^
+             bbOf(ProKnight) ^ bbOf(ProSilver) ^ bbOf(Horse ) ^ bbOf(Dragon )) != occupiedBB())
+        {
+            goto incorrect_position;
+        }
+        for (PieceType pt1 = Pawn; pt1 < PieceTypeNum; ++pt1) {
+            for (PieceType pt2 = pt1 + 1; pt2 < PieceTypeNum; ++pt2) {
+                if ((bbOf(pt1) & bbOf(pt2)))
+                    goto incorrect_position;
+            }
+        }
+    }
+
+    ++failedStep;
+    if (debugKingCount) {
+        int kingCount[ColorNum] = {0, 0};
+        if (bbOf(King).popCount() != 2)
+            goto incorrect_position;
+        if (!bbOf(King, Black).isOneBit())
+            goto incorrect_position;
+        if (!bbOf(King, White).isOneBit())
+            goto incorrect_position;
+        for (Square sq = SQ11; sq < SquareNum; ++sq) {
+            if (piece(sq) == BKing)
+                ++kingCount[Black];
+            if (piece(sq) == WKing)
+                ++kingCount[White];
+        }
+        if (kingCount[Black] != 1 || kingCount[White] != 1)
+            goto incorrect_position;
+    }
+
+    ++failedStep;
+    if (debugKingCapture) {
+        // 相手玉を取れないことを確認
+        const Color us = turn();
+        const Color them = oppositeColor(us);
+        const Square ksq = kingSquare(them);
+        if (attackersTo(us, ksq))
+            goto incorrect_position;
+    }
+
+    ++failedStep;
+    if (debugCheckerCount) {
+        if (2 < st_->checkersBB.popCount())
+            goto incorrect_position;
+    }
+
+    ++failedStep;
+    if (debugKey) {
+        if (getKey() != computeKey())
+            goto incorrect_position;
+    }
+
+    ++failedStep;
+    if (debugStateHand) {
+        if (st_->hand != hand(turn()))
+            goto incorrect_position;
+    }
+
+    ++failedStep;
+    if (debugPiece) {
+        for (Square sq = SQ11; sq < SquareNum; ++sq) {
+            const Piece pc = piece(sq);
+            if (pc == Empty) {
+                if (!emptyBB().isSet(sq))
+                    goto incorrect_position;
+            }
+            else {
+                if (!bbOf(pieceToPieceType(pc), pieceToColor(pc)).isSet(sq))
+                    goto incorrect_position;
+            }
+        }
+    }
+
+    ++failedStep;
+    if (debugMaterial) {
+        if (material() != computeMaterial())
+            goto incorrect_position;
+    }
+
+    ++failedStep;
+    {
+        int i;
+        if ((i = debugSetEvalList()) != 0) {
+            std::cout << "debugSetEvalList() error = " << i << std::endl;
+            goto incorrect_position;
+        }
+    }
+
+    prevKey = getKey();
+    return true;
+
+incorrect_position:
+    std::cout << "Error! failedStep = " << failedStep << std::endl;
+    std::cout << "prevKey = " << prevKey << std::endl;
+    std::cout << "currKey = " << getKey() << std::endl;
+    print();
+    return false;
+}
+#endif
+
+#if !defined NDEBUG
+int Position::debugSetEvalList() const {
+    // not implement
+    return 0;
+}
+#endif
+
+Key Position::computeBoardKey() const {
+    Key result = 0;
+    for (Square sq = SQ11; sq < SquareNum; ++sq) {
+        if (piece(sq) != Empty)
+            result += zobrist(pieceToPieceType(piece(sq)), sq, pieceToColor(piece(sq)));
+    }
+    if (turn() == White)
+        result ^= zobTurn();
+    return result;
+}
+
+Key Position::computeHandKey() const {
+    Key result = 0;
+    for (HandPiece hp = HPawn; hp < HandPieceNum; ++hp) {
+        for (Color c = Black; c < ColorNum; ++c) {
+            const int num = hand(c).numOf(hp);
+            for (int i = 0; i < num; ++i)
+                result += zobHand(hp, c);
+        }
+    }
+    return result;
+}
+
+// todo: isRepetition() に名前変えた方が良さそう。
+//       同一局面4回をきちんと数えていないけど問題ないか。
+RepetitionType Position::isDraw(const int checkMaxPly) const {
+    const int Start = 4;
+    int i = Start;
+    const int e = std::min(st_->pliesFromNull, checkMaxPly);
+
+    // 4手掛けないと千日手には絶対にならない。
+    if (i <= e) {
+        // 現在の局面と、少なくとも 4 手戻らないと同じ局面にならない。
+        // ここでまず 2 手戻る。
+        StateInfo* stp = st_->previous->previous;
+
+        do {
+            // 更に 2 手戻る。
+            stp = stp->previous->previous;
+            if (stp->key() == st_->key()) {
+                if (i <= st_->continuousCheck[turn()])
+                    return RepetitionLose;
+                else if (i <= st_->continuousCheck[oppositeColor(turn())])
+                    return RepetitionWin;
+#if defined BAN_BLACK_REPETITION
+                return (turn() == Black ? RepetitionLose : RepetitionWin);
+#elif defined BAN_WHITE_REPETITION
+                return (turn() == White ? RepetitionLose : RepetitionWin);
 #else
-		// Aperyの利き実装を用いる場合
-		// bishopEffect()で斜め四方向の利きが一気に求まるのでこれを分かつことはできない。
-			
-		// 斜め方向なら斜め方向の升をスキャンしてその上にある角・馬を足す
-		case DIRECT_RU: case DIRECT_LD:
-		case DIRECT_RD: case DIRECT_LU:
-			attackers |= bishopEffect(to, occupied) & pos.pieces(BISHOP_HORSE);
-			ASSERT_LV3((bishopStepEffect(to) & sq));
-			break;
-
+                return RepetitionDraw;
 #endif
-		case DIRECT_U:
-			// 後手の香 + 先後の飛車
-			attackers |= lanceEffect(BLACK, to, occupied) & (pos.pieces(ROOK_DRAGON) | pos.pieces(WHITE, LANCE));
-
-			ASSERT_LV3((lanceStepEffect(BLACK, to) & sq));
-			break;
-
-		case DIRECT_D:
-			// 先手の香 + 先後の飛車
-			attackers |= lanceEffect(WHITE, to, occupied) & (pos.pieces(ROOK_DRAGON) | pos.pieces(BLACK, LANCE));
-
-			ASSERT_LV3((lanceStepEffect(WHITE, to) & sq));
-			break;
-
-		case DIRECT_L: case DIRECT_R:
-			// 左右なので先後の飛車
-
-#if defined(USE_OLD_YANEURAOU_EFFECT)
-			attackers |= rookRankEffect(to, occupied) & pos.pieces(ROOK_DRAGON);
-#else
-			attackers |= rookEffect(to, occupied) & pos.pieces(ROOK_DRAGON);
-#endif
-
-			ASSERT_LV3(((rookStepEffect(to) & sq)));
-			break;
-
-		default:
-			UNREACHABLE;
-		}
-		else {
-			// DIRECT_MISC
-			ASSERT_LV3(!(bishopStepEffect(to) & sq));
-			ASSERT_LV3(!((rookStepEffect(to) & sq)));
-		}
-
-		// toに利く攻撃駒は、occupiedのその升が1になっている駒に限定する。
-		// 処理した駒はoccupiedのその升が0になるので自動的に除外される。
-		attackers &= occupied;
-
-		// この駒が成れるなら、成りの値を返すほうが良いかも。
-		// ※　最後にこの地点に残る駒を返すべきなのか。相手が取る/取らないを選択するので。
-		return type_of(pos.piece_on(sq));
-	}
-
-} // namespace
-
-
-/// Position::see() is a static exchange evaluator: It tries to estimate the
-/// material gain or loss resulting from a move.
-
-// Position::see()は静的交換評価器(SEE)である。これは、指し手による駒による得失の結果
-// を見積ろうと試みる。
-
-// 最初に動かす駒側の手番から見た値が返る。
-
-// ※　SEEの解説についてはググれ。
-//
-// ある升での駒の取り合いの結果、どれくらい駒得/駒損するかを評価する。
-// 最初に引数として、指し手mが与えられる。この指し手に対して、同金のように取り返され、さらに同歩成のように
-// 取り返していき、最終的な結果(評価値のうちの駒割りの部分の増減)を返すのが本来のSEE。
-
-// ただし、途中の手順では、同金とした場合と同金としない場合とで、(そのプレイヤーは自分が)得なほうを選択できるものとする。
-
-// ※　KINGを敵の利きに移動させる手は非合法手なので、ここで与えられる指し手にはそのような指し手は含まないものとする。
-// また、SEEの地点(to)の駒をKINGで取る手は含まれるが、そのKINGを取られることは考慮しなければならない。
-// 最後になった駒による成りの上昇値は考えない。
-
-// このseeの最終的な値が、vを以上になるかどうかを判定する。
-// こういう設計にすることで早期にvを超えないことが確定した時点でreturn出来る。
-
-bool Position::see_ge(Move m, Value threshold) const
-{
-	// null windowのときのαβ探索に似たアルゴリズムを用いる。
-
-	// 少し無駄ではあるが、Stockfishの挙動をなるべく忠実に再現する。
-
-	bool drop = is_drop(m);
-	// 駒の移動元(駒打ちの場合は)、移動先
-	// dropのときにはSQ_NBにしておくことで、pieces() ^ fromを無効化するhack
-	Square from = drop ? SQ_NB : from_sq(m);
-	Square to = to_sq(m);
-
-	// 次にtoの升で捕獲される駒
-	// 成りなら成りを評価したほうが良い可能性があるが、このあとの取り合いで指し手の成りを評価していないので…。
-	PieceType nextVictim = drop ? move_dropped_piece(m) : type_of(piece_on(from));
-
-	// 以下のwhileで想定している手番。
-	// 移動させる駒側の手番から始まるものとする。
-	// 次に列挙すべきは、この駒を取れる敵の駒なので、相手番に。
-	// ※「stm」とは"side to move"(手番側)を意味する用語。
-	Color us = color_of(moved_piece_after(m));
-	Color stm = ~us;
-
-	// 取り合いにおける収支。取った駒の価値と取られた駒の価値の合計。
-	// いまthresholdを超えるかどうかが問題なので、この分だけbiasを加えておく。
-	Value balance = (Value)Eval::CapturePieceValue[piece_on(to)] - threshold;
-
-	// この時点でマイナスになっているので早期にリターン。
-	if (balance < VALUE_ZERO)
-		return false;
-
-	// nextVictim == Kingの場合もある。玉が取られる指し手は考えなくて良いので
-	// この場合プラス収支と考えてよく、CapturePieceValue[KING] == 0が格納されているので
-	// 以下の式によりtrueが返る。
-
-	balance -= (Value)Eval::CapturePieceValue[nextVictim];
-
-	if (balance >= VALUE_ZERO)
-		return true;
-
-	// 相手側の手番ならtrue、自分側の手番であるならfalse
-	bool relativeStm = true;
-
-	// いま、以下のwhileのなかで想定している手番側の、sqの地点に利く駒
-	Bitboard stmAttackers;
-
-	// 盤上の駒(取り合いしていくうちにここから駒が無くなっていく)
-	// すでにfromとtoの駒は取られたはずなので消しておく。
-	Bitboard occupied = pieces() ^ from ^ to;
-
-	// すべてのattackerを列挙する。
-	Bitboard attackers = attackers_to(to, occupied) & occupied;
-
-	while (true)
-	{
-		stmAttackers = attackers & pieces(stm);
-
-		// pinnersが元の升にいる限りにおいては、pinされた駒から王以外への移動は許さない。
-
-		if (!(st->pinners[~stm] & occupied))
-			stmAttackers &= ~st->blockersForKing[stm];
-
-		// 手番側のtoに利いている駒がもうないなら、手番側の負けである。
-		if (!stmAttackers)
-			break;
-
-		// 次に価値の低い攻撃駒を調べて取り除く。
-
-		nextVictim = min_attacker(*this, to, stmAttackers, occupied, attackers);
-
-		stm = ~stm; // 相手番に
-
-		// Negamax the balance with alpha = balance, beta = balance+1 and
-		// add nextVictim's value.
-		//
-		//      (balance, balance+1) -> (-balance-1, -balance)
-		//
-		ASSERT_LV3(balance < VALUE_ZERO);
-
-		balance = -balance - 1 - CapturePieceValue[nextVictim];
-
-		// もしbalanceがnextVictimを取り去っても依然として非負(0か正)であるなら、これをもって勝利である。
-		// ただし最後に玉が残って、相手側がまだattackerを持っているときはstmを反転しないといけないので注意。
-		if (balance >= VALUE_ZERO)
-		{
-			if (nextVictim == KING && (attackers & pieces(stm)))
-				stm = ~stm;
-			break;
-		}
-		ASSERT_LV3(nextVictim != KING);
-	}
-	return us != stm; // 上のループは、手番側のtoへの利きがある駒が尽きたときに抜ける
+            }
+            else if (stp->boardKey == st_->boardKey) {
+                if (st_->hand.isEqualOrSuperior(stp->hand)) return RepetitionSuperior;
+                if (stp->hand.isEqualOrSuperior(st_->hand)) return RepetitionInferior;
+            }
+            i += 2;
+        } while (i <= e);
+    }
+    return NotRepetition;
 }
 
-#endif // defined (USE_SEE)
-
-// ----------------------------------
-//      千日手判定
-// ----------------------------------
-
-// 連続王手の千日手等で引き分けかどうかを返す
-RepetitionState Position::is_repetition(int repPly /* = 16 */) const
-{
-	// repPlyまで遡る
-	// 現在の局面と同じhash keyを持つ局面があれば、それは千日手局面であると判定する。
-
-	// 　rootより遡るなら、2度出現する(3度目の同一局面である)必要がある。
-	//   rootより遡らないなら、1度目(2度目の同一局面である)で千日手と判定する。
-	// cf.
-	//   Don't score as an immediate draw 2-fold repetitions of the root position
-	//   https://github.com/official-stockfish/Stockfish/commit/6d89d0b64a99003576d3e0ed616b43333c9eca01
-
-	// チェスだと千日手は同一局面3回(将棋だと4回)である。
-	// root以降で同一局面が2度出現した場合は、それを千日手として扱うのは妥当である。
-	// root以前の局面と現在の局面が一致している場合は、即座に千日手成立として扱うのは無理があるという判断のもと、
-	// 千日手確定のときのみ千日手とする処理がStockfishにはある。
-	// しかし、将棋では千日手成立には同一局面が4回出現する必要があるので、この場合、root以前に3回同じ局面が出現して
-	// いるかチェックする必要があるが、そこまでする必要があるとは思えない。ゆえに、このチェックを省略する。
-
-	// 【計測資料 35.】is_repetition() 同一局面をrootより遡って見つけたときに即座に千日手として扱うか。
-	
-	// pliesFromNullが未初期化になっていないかのチェックのためのassert
-	ASSERT_LV3(st->pliesFromNull >= 0);
-
-	// 遡り可能な手数。
-	// 最大でもrepPly手までしか遡らないことにする。
-	int end = std::min(repPly, st->pliesFromNull);
-
-	// 少なくとも4手かけないと千日手にはならないから、4手前から調べていく。
-	if (end < 4)
-		return REPETITION_NONE;
-
-	StateInfo* stp = st->previous->previous;
-
-	for (int i = 4; i <= end ; i += 2)
-	{
-		stp = stp->previous->previous;
-
-		// board_key : 盤上の駒のみのhash(手駒を除く)
-		// 盤上の駒が同じ状態であるかを判定する。
-		if (stp->board_key() == st->board_key())
-		{
-			// 手駒が一致するなら同一局面である。(2手ずつ遡っているので手番は同じである)
-			if (stp->hand == st->hand)
-			{
-				// 自分が王手をしている連続王手の千日手なのか？
-				if (i <= st->continuousCheck[sideToMove])
-					return REPETITION_LOSE;
-
-				// 相手が王手をしている連続王手の千日手なのか？
-				if (i <= st->continuousCheck[~sideToMove])
-					return REPETITION_WIN;
-
-				return REPETITION_DRAW;
-			}
-			else {
-				// 優等局面か劣等局面であるか。(手番が相手番になっている場合はいま考えない)
-				if (hand_is_equal_or_superior(st->hand, stp->hand))
-					return REPETITION_SUPERIOR;
-				if (hand_is_equal_or_superior(stp->hand, st->hand))
-					return REPETITION_INFERIOR;
-			}
-		}
-	}
-
-	// 同じhash keyの局面が見つからなかったので…。
-	return REPETITION_NONE;
+namespace {
+    void printHandPiece(const Position& pos, const HandPiece hp, const Color c, const std::string& str) {
+        if (pos.hand(c).numOf(hp)) {
+            const char* sign = (c == Black ? "+" : "-");
+            std::cout << "P" << sign;
+            for (u32 i = 0; i < pos.hand(c).numOf(hp); ++i)
+                std::cout << "00" << str;
+            std::cout << std::endl;
+        }
+    }
+}
+void Position::printHand(const Color c) const {
+    printHandPiece(*this, HPawn  , c, "FU");
+    printHandPiece(*this, HLance , c, "KY");
+    printHandPiece(*this, HKnight, c, "KE");
+    printHandPiece(*this, HSilver, c, "GI");
+    printHandPiece(*this, HGold  , c, "KI");
+    printHandPiece(*this, HBishop, c, "KA");
+    printHandPiece(*this, HRook  , c, "HI");
 }
 
-#if defined(CUCKOO)
-// この局面から以前の局面に到達する指し手があるか。
-// ply : 遡る手数
-bool Position::has_game_cycle(int plies_from_root, int rep_ply /*= 16*/) const
-{
-	int j;
+Position& Position::operator = (const Position& pos) {
+    memcpy(this, &pos, sizeof(Position));
+    startState_ = *st_;
+    st_ = &startState_;
+    nodes_ = 0;
 
-	int end = std::min(/* st->rule50*/ rep_ply , st->pliesFromNull);
-
-	if (end < 3)
-		return false;
-
-	Key originalKey = st->key();
-	StateInfo* stp = st->previous;
-
-	for (int i = 3; i <= end; i += 2)
-	{
-		stp = stp->previous->previous;
-
-		// やねうら王ではZobrist Hashに足し算を使っているので、差を取る必要がある。
-		// bit 0はside(手番)なので、ここは削る。
-		Key moveKey = (stp->key() - originalKey) >> 1;
-		if ((j = H1(moveKey), cuckoo[j] == moveKey)
-			|| (j = H2(moveKey), cuckoo[j] == moveKey))
-		{
-			Move move = cuckooMove[j];
-			Square s1 = from_sq(move);
-			Square s2 = to_sq(move);
-			Piece pc = (Piece)(move >> 16);
-			if (piece_on(s1) != pc)
-				continue;
-
-			// 間に駒がないのでたぶんいける。開き王手とか知らん。
-			// ざっくりした枝刈りにしか使わないのでこのへんの判定甘くても問題ない。
-
-			// あと、連続王手による千日手到達に関してはdraw_value返すのはやめたほうが…。
-			// これは、rating下がりうる。王手の指し手ではないことを条件に含めないと。
-
-			if (!(between_bb(s1, s2) & pieces()))
-			{
-				if (plies_from_root > i)
-					return true;
-
-				// For repetitions before or at the root, require one more
-				// rootまでに指し手が見つかった場合、もう一度同じ局面に遭遇する必要がある。
-
-				// Stockfish10のコード
-				//if (stp->repetition)
-				//	return true;
-
-				// Stockfish9の時のコード。(StateInfo->repetitionを持っていないのでこんなコードになる)
-				StateInfo* next_stp = stp;
-				for (int k = i + 2; k <= end; k += 2)
-				{
-					next_stp = next_stp->previous->previous;
-					if (next_stp->key() == stp->key())
-						return true;
-				}
-
-			}
-		}
-	}
-	return false;
-}
-#endif
-
-// ----------------------------------
-//      入玉判定
-// ----------------------------------
-
-#if defined(USE_ENTERING_KING_WIN)
-Move Position::DeclarationWin() const
-{
-	auto rule = Search::Limits.enteringKingRule;
-
-	switch (rule)
-	{
-		// 入玉ルールなし
-	case EKR_NONE: return MOVE_NONE;
-
-		// CSAルールに基づく宣言勝ちの条件を満たしているか
-		// 満たしているならば非0が返る。返し値は駒点の合計。
-		// cf.http://www.computer-shogi.org/protocol/tcp_ip_1on1_11.html
-	case EKR_24_POINT: // 24点法(31点以上で宣言勝ち)
-	case EKR_27_POINT: // 27点法 == CSAルール
-	{
-		/*
-		「入玉宣言勝ち」の条件(第13回選手権で使用のもの):
-
-		次の条件が成立する場合、勝ちを宣言できる(以下「入玉宣言勝ち」と云う)。
-		条件:
-		(a) 宣言側の手番である。
-		(b) 宣言側の玉が敵陣三段目以内に入っている。
-		(c) 宣言側が(大駒5点小駒1点の計算で)
-		・先手の場合28点以上の持点がある。
-		・後手の場合27点以上の持点がある。
-		・点数の対象となるのは、宣言側の持駒と敵陣三段目
-		以内に存在する玉を除く宣言側の駒のみである。
-		(d) 宣言側の敵陣三段目以内の駒は、玉を除いて10枚以上存在する。
-		(e) 宣言側の玉に王手がかかっていない。
-		(詰めろや必死であることは関係ない)
-		(f) 宣言側の持ち時間が残っている。(切れ負けの場合)
-		以上1つでも条件を満たしていない場合、宣言した方が負けとなる。
-		(注) このルールは、日本将棋連盟がアマチュアの公式戦で使用しているものである。
-
-		以上の宣言は、コンピュータが行い、画面上に明示する。
-		*/
-		// (a)宣言側の手番である。
-		// →　手番側でこの関数を呼び出して判定するのでそうだろう。
-
-		Color us = sideToMove;
-
-		// 敵陣
-		Bitboard ef = enemy_field(us);
-
-		// (b)宣言側の玉が敵陣三段目以内に入っている。
-		if (!(ef & king_square(us)))
-			return MOVE_NONE;
-
-		// (e)宣言側の玉に王手がかかっていない。
-		if (checkers())
-			return MOVE_NONE;
-
-
-		// (d)宣言側の敵陣三段目以内の駒は、玉を除いて10枚以上存在する。
-		int p1 = (pieces(us) & ef).pop_count();
-		// p1には玉も含まれているから11枚以上ないといけない
-		if (p1 < 11)
-			return MOVE_NONE;
-
-		// 敵陣にいる大駒の数
-		int p2 = ((pieces(us, BISHOP_HORSE, ROOK_DRAGON)) & ef).pop_count();
-
-		// 小駒1点、大駒5点、玉除く
-		// ＝　敵陣の自駒 + 敵陣の自駒の大駒×4 - 玉
-
-		// (c)
-		// ・先手の場合28点以上の持点がある。
-		// ・後手の場合27点以上の持点がある。
-		Hand h = hand[us];
-		int score = p1 + p2 * 4 - 1
-			+ hand_count(h, PAWN) + hand_count(h, LANCE) + hand_count(h, KNIGHT) + hand_count(h, SILVER)
-			+ hand_count(h, GOLD) + (hand_count(h, BISHOP) + hand_count(h, ROOK)) * 5;
-
-		// rule==EKR_27_POINTならCSAルール。rule==EKR_24_POINTなら24点法(30点以下引き分けなので31点以上あるときのみ勝ち扱いとする)
-		if (score < (rule == EKR_27_POINT ? (us == BLACK ? 28 : 27) : 31))
-			return MOVE_NONE;
-
-		// 評価関数でそのまま使いたいので非0のときは駒点を返しておく。
-		return MOVE_WIN;
-	}
-
-	// トライルールの条件を満たしているか。
-	case EKR_TRY_RULE:
-	{
-		Color us = sideToMove;
-		Square king_try_sq = (us == BLACK ? SQ_51 : SQ_59);
-		Square king_sq = king_square(us);
-
-		// 1) 初期陣形で敵玉がいた場所に自玉が移動できるか。
-		if (!(kingEffect(king_sq) & king_try_sq))
-			return MOVE_NONE;
-
-		// 2) トライする升に自駒がないか。
-		if (pieces(us) & king_try_sq)
-			return MOVE_NONE;
-
-		// 3) トライする升に移動させたときに相手に取られないか。
-		if (effected_to(~us, king_try_sq, king_sq))
-			return MOVE_NONE;
-
-		// 王の移動の指し手により勝ちが確定する
-		return make_move(king_sq, king_try_sq, us,KING);
-	}
-
-	default:
-		UNREACHABLE;
-		return MOVE_NONE;
-	}
-}
-#endif
-
-// ----------------------------------
-//      内部情報の正当性のテスト
-// ----------------------------------
-
-bool Position::pos_is_ok() const
-{
-	// Bitboardの完全なテストには時間がかかるので、あまりややこしいテストは現実的ではない。
-
-#if 0
-	// 1) 盤上の駒と手駒を合わせて40駒あるか。
-	// →　駒落ちに対応させたいのでコメントアウト
-
-	// それぞれの駒のあるべき枚数
-	const int ptc0[KING] = { 2/*玉*/,18/*歩*/,4/*香*/,4/*桂*/,4/*銀*/,2/*角*/,2/*飛*/,4/*金*/ };
-	// カウント用の変数
-	int ptc[PIECE_WHITE] = { 0 };
-
-	int count = 0;
-	for (auto sq : SQ)
-	{
-		Piece pc = piece_on(sq);
-		if (pc != NO_PIECE)
-		{
-			++count;
-			++ptc[raw_type_of(pc)];
-		}
-	}
-	for (auto c : COLOR)
-		for (Piece pr = PIECE_HAND_ZERO; pr < PIECE_HAND_NB; ++pr)
-		{
-			int ct = hand_count(hand[c], pr);
-			count += ct;
-			ptc[pr] += ct;
-		}
-
-	if (count != 40)
-		return false;
-
-	// 2) それぞれの駒の枚数は合っているか
-	for (Piece pt = PIECE_ZERO; pt < KING; ++pt)
-		if (ptc[pt] != ptc0[pt])
-			return false;
-#endif
-
-	// 3) 王手している駒
-	if (st->checkersBB != attackers_to(~sideToMove, king_square(sideToMove)))
-		return false;
-
-	// 4) 相手玉が取れるということはないか
-	if (effected_to(sideToMove, king_square(~sideToMove)))
-		return false;
-
-	// 5) occupied bitboardは合っているか
-	if ((pieces() != (pieces(BLACK) | pieces(WHITE))) || (pieces(BLACK) & pieces(WHITE)))
-		return false;
-
-	// 6) 王手している駒は敵駒か
-	if (checkers() & pieces(side_to_move()))
-		return false;
-
-	// 二歩のチェックなど云々かんぬん..面倒くさいので省略。
-
-	return true;
+    assert(isOK());
+    return *this;
 }
 
-// 明示的な実体化
-template bool Position::pseudo_legal_s<false>(const Move m) const;
-template bool Position::pseudo_legal_s< true>(const Move m) const;
+void Position::set(const std::string& sfen, Thread* th) {
+    Piece promoteFlag = UnPromoted;
+    std::istringstream ss(sfen);
+    char token;
+    Square sq = SQ91;
+
+    Searcher* s = std::move(searcher_);
+    clear();
+    setSearcher(s);
+
+    // 盤上の駒
+    while (ss.get(token) && token != ' ') {
+        if (isdigit(token))
+            sq += DeltaE * (token - '0');
+        else if (token == '/')
+            sq += (DeltaW * 9) + DeltaS;
+        else if (token == '+')
+            promoteFlag = Promoted;
+        else if (g_charToPieceUSI.isLegalChar(token)) {
+            if (isInSquare(sq)) {
+                setPiece(g_charToPieceUSI.value(token) + promoteFlag, sq);
+                promoteFlag = UnPromoted;
+                sq += DeltaE;
+            }
+            else
+                goto INCORRECT;
+        }
+        else
+            goto INCORRECT;
+    }
+    kingSquare_[Black] = bbOf(King, Black).constFirstOneFromSQ11();
+    kingSquare_[White] = bbOf(King, White).constFirstOneFromSQ11();
+    goldsBB_ = bbOf(Gold, ProPawn, ProLance, ProKnight, ProSilver);
+
+    // 手番
+    while (ss.get(token) && token != ' ') {
+        if (token == 'b')
+            turn_ = Black;
+        else if (token == 'w')
+            turn_ = White;
+        else
+            goto INCORRECT;
+    }
+
+    // 持ち駒
+    for (int digits = 0; ss.get(token) && token != ' '; ) {
+        if (token == '-')
+            memset(hand_, 0, sizeof(hand_));
+        else if (isdigit(token))
+            digits = digits * 10 + token - '0';
+        else if (g_charToPieceUSI.isLegalChar(token)) {
+            // 持ち駒を32bit に pack する
+            const Piece piece = g_charToPieceUSI.value(token);
+            setHand(piece, (digits == 0 ? 1 : digits));
+
+            digits = 0;
+        }
+        else
+            goto INCORRECT;
+    }
+
+    // 次の手が何手目か
+    ss >> gamePly_;
+
+    // 残り時間, hash key, (もし実装するなら)駒番号などをここで設定
+    st_->boardKey = computeBoardKey();
+    st_->handKey = computeHandKey();
+    st_->hand = hand(turn());
+
+    setEvalList();
+    findCheckers();
+    st_->material = computeMaterial();
+    thisThread_ = th;
+
+    return;
+INCORRECT:
+    std::cout << "incorrect SFEN string : " << sfen << std::endl;
+}
+
+bool Position::set(const HuffmanCodedPos& hcp, Thread* th) {
+    Searcher* s = std::move(searcher_);
+    clear();
+    setSearcher(s);
+
+    HuffmanCodedPos tmp = hcp; // ローカルにコピー
+    BitStream bs(tmp.data);
+
+    // 手番
+    turn_ = static_cast<Color>(bs.getBit());
+
+    // 玉の位置
+    Square sq0 = (Square)bs.getBits(7);
+    Square sq1 = (Square)bs.getBits(7);
+    setPiece(BKing, static_cast<Square>(sq0));
+    setPiece(WKing, static_cast<Square>(sq1));
+
+    // 盤上の駒
+    for (Square sq = SQ11; sq < SquareNum; ++sq) {
+        if (pieceToPieceType(piece(sq)) == King) // piece(sq) は BKing, WKing, Empty のどれか。
+            continue;
+        HuffmanCode hc = {0, 0};
+        while (hc.numOfBits <= 8) {
+            hc.code |= bs.getBit() << hc.numOfBits++;
+            if (HuffmanCodedPos::boardCodeToPieceHash.value(hc.key) != PieceNone) {
+                const Piece pc = HuffmanCodedPos::boardCodeToPieceHash.value(hc.key);
+                if (pc != Empty)
+                    setPiece(HuffmanCodedPos::boardCodeToPieceHash.value(hc.key), sq);
+                break;
+            }
+        }
+        if (HuffmanCodedPos::boardCodeToPieceHash.value(hc.key) == PieceNone)
+            goto INCORRECT_HUFFMAN_CODE;
+    }
+    while (bs.data() != std::end(tmp.data)) {
+        HuffmanCode hc = {0, 0};
+        while (hc.numOfBits <= 8) {
+            hc.code |= bs.getBit() << hc.numOfBits++;
+            const Piece pc = HuffmanCodedPos::handCodeToPieceHash.value(hc.key);
+            if (pc != PieceNone) {
+                hand_[pieceToColor(pc)].plusOne(pieceTypeToHandPiece(pieceToPieceType(pc)));
+                break;
+            }
+        }
+        if (HuffmanCodedPos::handCodeToPieceHash.value(hc.key) == PieceNone)
+            goto INCORRECT_HUFFMAN_CODE;
+    }
+
+    kingSquare_[Black] = bbOf(King, Black).constFirstOneFromSQ11();
+    kingSquare_[White] = bbOf(King, White).constFirstOneFromSQ11();
+    goldsBB_ = bbOf(Gold, ProPawn, ProLance, ProKnight, ProSilver);
+
+    gamePly_ = 1; // ply の情報は持っていないので 1 にしておく。
+
+    st_->boardKey = computeBoardKey();
+    st_->handKey = computeHandKey();
+    st_->hand = hand(turn());
+
+    setEvalList();
+    findCheckers();
+    st_->material = computeMaterial();
+    thisThread_ = th;
+
+    return true;
+INCORRECT_HUFFMAN_CODE:
+    std::cout << "incorrect Huffman code." << std::endl;
+    return false;
+}
+
+bool Position::moveGivesCheck(const Move move) const {
+    return moveGivesCheck(move, CheckInfo(*this));
+}
+
+// move が王手なら true
+bool Position::moveGivesCheck(const Move move, const CheckInfo& ci) const {
+    assert(isOK());
+    assert(ci.dcBB == discoveredCheckBB());
+
+    const Square to = move.to();
+    if (move.isDrop()) {
+        const PieceType ptTo = move.pieceTypeDropped();
+        // Direct Check ?
+        if (ci.checkBB[ptTo].isSet(to))
+            return true;
+    }
+    else {
+        const Square from = move.from();
+        const PieceType ptFrom = move.pieceTypeFrom();
+        const PieceType ptTo = move.pieceTypeTo(ptFrom);
+        assert(ptFrom == pieceToPieceType(piece(from)));
+        // Direct Check ?
+        if (ci.checkBB[ptTo].isSet(to))
+            return true;
+
+        // Discovery Check ?
+        if (isDiscoveredCheck(from, to, kingSquare(oppositeColor(turn())), ci.dcBB))
+            return true;
+    }
+
+    return false;
+}
+
+Piece Position::movedPiece(const Move m) const {
+    return colorAndPieceTypeToPiece(turn(), m.pieceTypeFromOrDropped());
+}
+
+void Position::clear() {
+    memset(this, 0, sizeof(Position));
+    st_ = &startState_;
+}
+
+// 先手、後手に関わらず、sq へ移動可能な Bitboard を返す。
+Bitboard Position::attackersTo(const Square sq, const Bitboard& occupied) const {
+    const Bitboard golds = goldsBB();
+    return (((attacksFrom<Pawn  >(Black, sq          ) & bbOf(Pawn  ))
+             | (attacksFrom<Lance >(Black, sq, occupied) & bbOf(Lance ))
+             | (attacksFrom<Knight>(Black, sq          ) & bbOf(Knight))
+             | (attacksFrom<Silver>(Black, sq          ) & bbOf(Silver))
+             | (attacksFrom<Gold  >(Black, sq          ) & golds       ))
+            & bbOf(White))
+        | (((attacksFrom<Pawn  >(White, sq          ) & bbOf(Pawn  ))
+            | (attacksFrom<Lance >(White, sq, occupied) & bbOf(Lance ))
+            | (attacksFrom<Knight>(White, sq          ) & bbOf(Knight))
+            | (attacksFrom<Silver>(White, sq          ) & bbOf(Silver))
+            | (attacksFrom<Gold  >(White, sq          ) & golds))
+           & bbOf(Black))
+        | (attacksFrom<Bishop>(sq, occupied) & bbOf(Bishop, Horse        ))
+        | (attacksFrom<Rook  >(sq, occupied) & bbOf(Rook  , Dragon       ))
+        | (attacksFrom<King  >(sq          ) & bbOf(King  , Horse, Dragon));
+}
+
+// occupied を Position::occupiedBB() 以外のものを使用する場合に使用する。
+Bitboard Position::attackersTo(const Color c, const Square sq, const Bitboard& occupied) const {
+    const Color opposite = oppositeColor(c);
+    return ((attacksFrom<Pawn  >(opposite, sq          ) & bbOf(Pawn  ))
+            | (attacksFrom<Lance >(opposite, sq, occupied) & bbOf(Lance ))
+            | (attacksFrom<Knight>(opposite, sq          ) & bbOf(Knight))
+            | (attacksFrom<Silver>(opposite, sq          ) & bbOf(Silver, King, Dragon))
+            | (attacksFrom<Gold  >(opposite, sq          ) & (bbOf(King  , Horse) | goldsBB()))
+            | (attacksFrom<Bishop>(          sq, occupied) & bbOf(Bishop, Horse        ))
+            | (attacksFrom<Rook  >(          sq, occupied) & bbOf(Rook  , Dragon       )))
+        & bbOf(c);
+}
+
+// 玉以外で sq へ移動可能な c 側の駒の Bitboard を返す。
+Bitboard Position::attackersToExceptKing(const Color c, const Square sq) const {
+    const Color opposite = oppositeColor(c);
+    return ((attacksFrom<Pawn  >(opposite, sq) & bbOf(Pawn  ))
+            | (attacksFrom<Lance >(opposite, sq) & bbOf(Lance ))
+            | (attacksFrom<Knight>(opposite, sq) & bbOf(Knight))
+            | (attacksFrom<Silver>(opposite, sq) & bbOf(Silver, Dragon))
+            | (attacksFrom<Gold  >(opposite, sq) & (goldsBB() | bbOf(Horse)))
+            | (attacksFrom<Bishop>(          sq) & bbOf(Bishop, Horse ))
+            | (attacksFrom<Rook  >(          sq) & bbOf(Rook  , Dragon)))
+        & bbOf(c);
+}
+
+Score Position::computeMaterial() const {
+    Score s = ScoreZero;
+    for (PieceType pt = Pawn; pt < PieceTypeNum; ++pt) {
+        const int num = bbOf(pt, Black).popCount() - bbOf(pt, White).popCount();
+        s += num * pieceScore(pt);
+    }
+    for (PieceType pt = Pawn; pt < King; ++pt) {
+        const int num = hand(Black).numOf(pieceTypeToHandPiece(pt)) - hand(White).numOf(pieceTypeToHandPiece(pt));
+        s += num * pieceScore(pt);
+    }
+    return s;
+}
