@@ -2,9 +2,9 @@
 
 ARCH=SSE42
 
-make Makefile TARGET_CPU=$ARCH YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE > /dev/null
+make Makefile -C . TARGET_CPU=$ARCH YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE > /dev/null
 
-for filen in $(ls ./engine/);
+for filen in $(ls .);
 do
 	echo $filen
 done;
